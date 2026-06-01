@@ -1,6 +1,6 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 import uuid
 import os
 import shutil
@@ -16,10 +16,21 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-  allow_credentials=False,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str, request: Request):
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 ACR_HOST = "identify-us-west-2.acrcloud.com"
 ACR_KEY = "da746b8377796097a8b57b1cb4fe8a5c"
@@ -79,7 +90,6 @@ async def split_audio(file: UploadFile = File(...)):
 
     output_pattern = folder + "/track_%03d.mp3"
 
-    # Usa asyncio para não bloquear o servidor
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-i", input_path,
         "-f", "segment",
