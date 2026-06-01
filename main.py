@@ -28,16 +28,22 @@ async def split_audio(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
     os.makedirs(f"outputs/{job_id}", exist_ok=True)
 
-    input_path = f"outputs/{job_id}/input{os.path.splitext(file.filename)[1]}"
+    input_path = f"outputs/{job_id}/input.mp3"
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Divide em partes de 3 minutos usando ffmpeg direto
     output_pattern = f"outputs/{job_id}/track_%03d.mp3"
+
     subprocess.run([
         "ffmpeg", "-i", input_path,
-        "-f", "segment", "-segment_time", "180",
-        "-c:a", "libmp3lame", "-q:a", "2", output_pattern
+        "-f", "segment",
+        "-segment_time", "180",
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-ab", "192k",
+        "-ar", "44100",
+        "-y",
+        output_pattern
     ], check=True)
 
     tracks = []
