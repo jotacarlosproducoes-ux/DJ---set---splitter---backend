@@ -4,7 +4,7 @@ from fastapi.responses import FileResponse
 import uuid
 import os
 import shutil
-import subprocess
+import asyncio
 import requests
 import hmac
 import hashlib
@@ -23,7 +23,7 @@ app.add_middleware(
 
 ACR_HOST = "identify-us-west-2.acrcloud.com"
 ACR_KEY = "da746b8377796097a8b57b1cb4fe8a5c"
-ACR_SECRET = "Qxt4orcUoVSgkZPP4vfqdYGf4Vl3Au5j0SKRddl"
+ACR_SECRET = "Qxt4orcUoVSgkZPP4vfqdYGf4V13Au5j0SKRddl"
 
 jobs = {}
 
@@ -56,24 +56,31 @@ def identify_song(audio_path, timestamp):
         pass
     return {"title": "Faixa " + str(timestamp) + "s", "artist": "Desconhecido"}
 
+
 @app.get("/")
 def root():
     return {"status": "DJ Set Splitter API online"}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.post("/split")
 async def split_audio(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
     folder = "outputs/" + job_id
     os.makedirs(folder, exist_ok=True)
+
     input_path = folder + "/input.mp3"
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
+
     output_pattern = folder + "/track_%03d.mp3"
-    subprocess.run([
+
+    # Usa asyncio para não bloquear o servidor
+    proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-i", input_path,
         "-f", "segment",
         "-segment_time", "180",
@@ -82,8 +89,12 @@ async def split_audio(file: UploadFile = File(...)):
         "-ab", "192k",
         "-ar", "44100",
         "-y",
-        output_pattern
-    ], check=True)
+        output_pattern,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    await proc.communicate()
+
     tracks = []
     fnames = sorted(os.listdir(folder))
     i = 0
@@ -100,17 +111,20 @@ async def split_audio(file: UploadFile = File(...)):
                 "timestamp": timestamp
             })
             i += 1
+
     jobs[job_id] = {"status": "done", "tracks": tracks}
     return {"job_id": job_id, "status": "done", "tracks": tracks}
 
+
 @app.get("/status/{job_id}")
-def get_status(job_id):
+def get_status(job_id: str):
     if job_id not in jobs:
         return {"error": "Job nao encontrado"}
     return jobs[job_id]
 
+
 @app.get("/download/{job_id}/{filename}")
-def download_track(job_id, filename):
+def download_track(job_id: str, filename: str):
     path = "outputs/" + job_id + "/" + filename
     if not os.path.exists(path):
         return {"error": "Arquivo nao encontrado"}
