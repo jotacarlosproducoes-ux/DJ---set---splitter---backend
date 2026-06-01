@@ -1,123 +1,186 @@
 from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
-import uuid
-import os
-import shutil
-import asyncio
-import requests
-import hmac
-import hashlib
-import base64
-import time
-import urllib.parse
+import uuid, os, shutil, asyncio, requests, hmac, hashlib, base64, time, urllib.parse
+import numpy as np
 
 app = FastAPI()
 
-# ─── CORS: permite qualquer origem (necessário para Lovable + preview) ─────────
 class CORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
-            return Response(
-                status_code=200,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Max-Age": "86400",
-                }
-            )
+            return Response(status_code=200, headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age": "86400",
+            })
         response = await call_next(request)
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "*"
-        # Necessário para o player de áudio funcionar no browser
         response.headers["Accept-Ranges"] = "bytes"
         return response
 
 app.add_middleware(CORSMiddleware)
 
-ACR_ACCESS_KEY = "da746b8377796097a8b57b1cb4fe8a5c"
+ACR_ACCESS_KEY    = "da746b8377796097a8b57b1cb4fe8a5c"
 ACR_ACCESS_SECRET = "Qjxt4orcUoVSgkZPP4vfqdYGf4Vl3Au5j0SKRddl"
-ACR_REQURL = "https://identify-us-west-2.acrcloud.com/v1/identify"
+ACR_REQURL        = "https://identify-us-west-2.acrcloud.com/v1/identify"
 
 jobs = {}
 
+
+# ─── Identifica música via ACRCloud ───────────────────────────────────────────
 def identify_song(audio_path, timestamp):
     try:
         duration_result = os.popen(
-            f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
+            f'ffprobe -v error -show_entries format=duration '
+            f'-of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
         ).read().strip()
-        duration = float(duration_result) if duration_result else 180
+        duration    = float(duration_result) if duration_result else 180
         sample_start = max(0, duration / 2 - 10)
-        sample_path = audio_path + "_sample.mp3"
+        sample_path  = audio_path + "_sample.mp3"
         os.system(f'ffmpeg -ss {sample_start} -t 20 -i "{audio_path}" -y "{sample_path}" -loglevel quiet')
-        sample_file = sample_path if os.path.exists(sample_path) else audio_path
+        sample_file  = sample_path if os.path.exists(sample_path) else audio_path
 
         with open(sample_file, "rb") as f:
             sample_bytes = os.path.getsize(sample_file)
-            sample_data = f.read()
+            sample_data  = f.read()
 
-        http_method = "POST"
-        http_uri = "/v1/identify"
-        data_type = "audio"
-        signature_version = "1"
-        ts = time.time()
-
-        string_to_sign = (
-            http_method + "\n" + http_uri + "\n" +
-            ACR_ACCESS_KEY + "\n" + data_type + "\n" +
-            signature_version + "\n" + str(ts)
-        )
-
+        ts  = time.time()
+        stts = f"POST\n/v1/identify\n{ACR_ACCESS_KEY}\naudio\n1\n{ts}"
         sign = base64.b64encode(
-            hmac.new(
-                ACR_ACCESS_SECRET.encode('ascii'),
-                string_to_sign.encode('ascii'),
-                digestmod=hashlib.sha1
-            ).digest()
-        ).decode('ascii')
+            hmac.new(ACR_ACCESS_SECRET.encode(), stts.encode(), hashlib.sha1).digest()
+        ).decode()
 
-        files = [('sample', ('sample.mp3', sample_data, 'audio/mpeg'))]
-        data = {
-            'access_key': ACR_ACCESS_KEY,
-            'sample_bytes': sample_bytes,
-            'timestamp': str(ts),
-            'signature': sign,
-            'data_type': data_type,
-            'signature_version': signature_version,
-        }
-
-        response = requests.post(ACR_REQURL, files=files, data=data, timeout=15)
-        result = response.json()
-        print(f"ACRCloud response: {result}")
-
+        resp   = requests.post(ACR_REQURL, timeout=15,
+                               files=[('sample', ('sample.mp3', sample_data, 'audio/mpeg'))],
+                               data={'access_key': ACR_ACCESS_KEY, 'sample_bytes': sample_bytes,
+                                     'timestamp': str(ts), 'signature': sign,
+                                     'data_type': 'audio', 'signature_version': '1'})
+        result = resp.json()
+        print(f"ACRCloud: {result}")
         if os.path.exists(sample_path):
             os.remove(sample_path)
-
         if result.get("status", {}).get("code") == 0:
-            music = result["metadata"]["music"][0]
-            title = music.get("title", "Desconhecida")
-            artist = music.get("artists", [{}])[0].get("name", "Desconhecido")
-            return {"title": title, "artist": artist}
-
+            music  = result["metadata"]["music"][0]
+            return {"title":  music.get("title", "Desconhecida"),
+                    "artist": music.get("artists", [{}])[0].get("name", "Desconhecido")}
     except Exception as e:
         print(f"ACRCloud error: {e}")
+    return {"title": f"Faixa {int(timestamp)}s", "artist": "Desconhecido"}
 
-    return {"title": "Faixa " + str(int(timestamp)) + "s", "artist": "Desconhecido"}
+
+# ─── Extensão inteligente de faixa ───────────────────────────────────────────
+def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60) -> bool:
+    """
+    Estende uma faixa usando análise de estrutura musical:
+    1. Converte MP3 → WAV
+    2. Detecta BPM e batidas com librosa
+    3. Divide em segmentos de 8 compassos
+    4. Identifica o segmento de maior energia (refrão/drop)
+    5. Duplica esse segmento na posição certa (cria versão estendida)
+    6. Aplica crossfade suave entre seções
+    7. Exporta como MP3
+    """
+    try:
+        import librosa
+        import soundfile as sf
+        from scipy.signal import fftconvolve
+
+        tmp_wav     = input_mp3 + "_tmp.wav"
+        tmp_ext_wav = input_mp3 + "_extended.wav"
+
+        # 1. MP3 → WAV
+        ret = os.system(f'ffmpeg -i "{input_mp3}" -ar 44100 -ac 2 -y "{tmp_wav}" -loglevel quiet')
+        if ret != 0 or not os.path.exists(tmp_wav):
+            return False
+
+        # 2. Carrega áudio
+        y, sr = librosa.load(tmp_wav, sr=44100, mono=False)
+        if y.ndim == 1:
+            y = np.stack([y, y])          # garante stereo
+        y_mono = librosa.to_mono(y)
+
+        # 3. Detecta BPM e batidas
+        tempo, beats = librosa.beat.beat_track(y=y_mono, sr=sr)
+        beat_frames  = librosa.frames_to_samples(beats)
+        print(f"[EXTEND] BPM detectado: {tempo:.1f}")
+
+        # 4. Divide em segmentos de 8 compassos (32 batidas)
+        beats_per_segment = 32
+        segments = []
+        for i in range(0, len(beat_frames) - beats_per_segment, beats_per_segment):
+            start = beat_frames[i]
+            end   = beat_frames[min(i + beats_per_segment, len(beat_frames) - 1)]
+            seg   = y_mono[start:end]
+            energy = float(np.mean(seg ** 2))
+            segments.append({"start": start, "end": end, "energy": energy, "index": i})
+
+        if not segments:
+            os.remove(tmp_wav)
+            return False
+
+        # 5. Segmento de maior energia = drop/refrão
+        best = max(segments, key=lambda s: s["energy"])
+        print(f"[EXTEND] Melhor segmento: {best['start']/sr:.1f}s – {best['end']/sr:.1f}s")
+
+        # 6. Monta versão estendida:
+        #    [original completa] + [crossfade] + [segmento do drop repetido]
+        seg_audio    = y[:, best["start"]:best["end"]]   # stereo
+        fade_samples = min(sr * 4, seg_audio.shape[1])   # 4s de crossfade
+
+        # Fade out no final do segmento de repetição
+        fade_out = np.linspace(1.0, 0.0, fade_samples)
+        seg_faded = seg_audio.copy()
+        seg_faded[:, -fade_samples:] *= fade_out
+
+        # Fade in no início do segmento de repetição
+        fade_in = np.linspace(0.0, 1.0, fade_samples)
+        seg_faded[:, :fade_samples] *= fade_in
+
+        # Quantas repetições para atingir o tempo extra desejado
+        seg_duration = seg_audio.shape[1] / sr
+        reps = max(1, int(np.ceil(target_extra_seconds / seg_duration)))
+        extension = np.concatenate([seg_faded] * reps, axis=1)
+
+        # Junta: original + extensão
+        extended = np.concatenate([y, extension], axis=1)
+
+        # 7. Salva WAV e converte para MP3
+        extended_t = extended.T   # soundfile espera (samples, channels)
+        sf.write(tmp_ext_wav, extended_t, sr, subtype="PCM_16")
+
+        ret2 = os.system(
+            f'ffmpeg -i "{tmp_ext_wav}" -acodec libmp3lame -ab 320k -ar 44100 -y "{output_mp3}" -loglevel quiet'
+        )
+
+        # Limpa temporários
+        for f in [tmp_wav, tmp_ext_wav]:
+            if os.path.exists(f):
+                os.remove(f)
+
+        return ret2 == 0 and os.path.exists(output_mp3)
+
+    except Exception as e:
+        print(f"[EXTEND] Erro: {e}")
+        for f in [input_mp3 + "_tmp.wav", input_mp3 + "_extended.wav"]:
+            if os.path.exists(f):
+                os.remove(f)
+        return False
 
 
 def safe_filename(name: str) -> str:
-    """Preserva UTF-8 (Tiësto, acentos) mas remove caracteres inválidos em nomes de arquivo"""
     for ch in r'\/:*?"<>|':
         name = name.replace(ch, "_")
     return name.strip()
 
 
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"status": "DJ Set Splitter API online"}
-
 
 @app.get("/health")
 def health():
@@ -134,42 +197,34 @@ async def split_audio(file: UploadFile = File(...)):
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    output_pattern = folder + "/track_%03d.mp3"
-
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-i", input_path,
-        "-f", "segment",
-        "-segment_time", "180",
-        "-vn", "-acodec", "mp3",
-        "-ab", "192k", "-ar", "44100",
-        "-y", output_pattern,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        "-f", "segment", "-segment_time", "180",
+        "-vn", "-acodec", "mp3", "-ab", "192k", "-ar", "44100",
+        "-y", folder + "/track_%03d.mp3",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     await proc.communicate()
 
     tracks = []
-    fnames = sorted(os.listdir(folder))
-    i = 0
-    for fname in fnames:
-        if fname.startswith("track_") and fname.endswith(".mp3"):
-            track_path = folder + "/" + fname
-            ts = i * 180
-            info = identify_song(track_path, ts)
-            display_name = info["artist"] + " - " + info["title"]
-            track_id = fname.replace(".mp3", "")
-            tracks.append({
-                "id": track_id,
-                "name": display_name,
-                "artist": info["artist"],
-                "title": info["title"],
-                "timestamp": ts,
-                # URL sem query string — funciona para player E download
-                "url": "/download/" + job_id + "/" + fname,
-                "url_mp3": "/download/" + job_id + "/" + fname + "?format=mp3",
-                "url_wav": "/download/" + job_id + "/" + fname + "?format=wav",
-            })
-            i += 1
+    for i, fname in enumerate(sorted(f for f in os.listdir(folder)
+                                     if f.startswith("track_") and f.endswith(".mp3"))):
+        track_path   = folder + "/" + fname
+        ts           = i * 180
+        info         = identify_song(track_path, ts)
+        display_name = info["artist"] + " - " + info["title"]
+        track_id     = fname.replace(".mp3", "")
+        tracks.append({
+            "id":       track_id,
+            "name":     display_name,
+            "artist":   info["artist"],
+            "title":    info["title"],
+            "timestamp": ts,
+            "url":      f"/download/{job_id}/{fname}",
+            "url_mp3":  f"/download/{job_id}/{fname}?format=mp3",
+            "url_wav":  f"/download/{job_id}/{fname}?format=wav",
+            "url_extended": f"/download/{job_id}/{fname}?format=extended",
+        })
 
     jobs[job_id] = {"status": "done", "tracks": tracks}
     return {"job_id": job_id, "status": "done", "tracks": tracks}
@@ -183,77 +238,65 @@ def get_status(job_id: str):
 
 
 @app.get("/download/{job_id}/{filename}")
-async def download_track(job_id: str, filename: str, format: str = "mp3"):
-    """
-    Serve o arquivo para player (sem format) ou download (format=mp3/wav).
-    Suporta Range requests para o player de áudio funcionar no browser.
-    """
+async def download_track(job_id: str, filename: str, format: str = "stream"):
     base_filename = filename if filename.endswith(".mp3") else filename + ".mp3"
-    mp3_path = "outputs/" + job_id + "/" + base_filename
+    mp3_path      = f"outputs/{job_id}/{base_filename}"
 
     if not os.path.exists(mp3_path):
-        return Response(
-            content='{"error": "Arquivo nao encontrado"}',
-            status_code=404,
-            media_type="application/json"
-        )
+        return Response(content='{"error":"Arquivo nao encontrado"}',
+                        status_code=404, media_type="application/json")
 
-    # Descobre nome amigável
+    # Nome amigável
     display_name = base_filename.replace(".mp3", "")
     if job_id in jobs:
-        track_id = base_filename.replace(".mp3", "")
+        tid = base_filename.replace(".mp3", "")
         for t in jobs[job_id].get("tracks", []):
-            if t.get("id") == track_id:
+            if t.get("id") == tid:
                 display_name = safe_filename(t["name"])
                 break
 
-    # ── WAV: converte e serve ──────────────────────────────────────────────────
+    # ── Versão estendida ──────────────────────────────────────────────────────
+    if format == "extended":
+        ext_path = mp3_path.replace(".mp3", "_extended.mp3")
+        if not os.path.exists(ext_path):
+            loop = asyncio.get_event_loop()
+            ok   = await loop.run_in_executor(None, extend_track, mp3_path, ext_path, 60)
+            if not ok:
+                return Response(content='{"error":"Falha ao gerar versao estendida"}',
+                                status_code=500, media_type="application/json")
+        encoded = urllib.parse.quote(display_name + "_extended.mp3")
+        return FileResponse(ext_path, media_type="audio/mpeg", headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",
+        })
+
+    # ── WAV ───────────────────────────────────────────────────────────────────
     if format == "wav":
         wav_path = mp3_path.replace(".mp3", ".wav")
         if not os.path.exists(wav_path):
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-i", mp3_path,
-                "-acodec", "pcm_s16le",
-                "-ar", "44100", "-ac", "2",
-                "-y", wav_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                "ffmpeg", "-i", mp3_path, "-acodec", "pcm_s16le",
+                "-ar", "44100", "-ac", "2", "-y", wav_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
             await proc.communicate()
-
         if not os.path.exists(wav_path):
-            return Response(
-                content='{"error": "Falha ao converter para WAV"}',
-                status_code=500,
-                media_type="application/json"
-            )
-
+            return Response(content='{"error":"Falha ao converter para WAV"}',
+                            status_code=500, media_type="application/json")
         encoded = urllib.parse.quote(display_name + ".wav")
-        return FileResponse(
-            wav_path,
-            media_type="audio/wav",
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
-                "Access-Control-Allow-Origin": "*",
-                "Accept-Ranges": "bytes",
-            }
-        )
-
-    # ── MP3: serve direto com suporte a Range (necessário para o player) ──────
-    file_size = os.path.getsize(mp3_path)
-    encoded = urllib.parse.quote(display_name + ".mp3")
-
-    # Se for só streaming (player), serve sem forçar download
-    is_download = format == "mp3"
-    disposition = f"attachment; filename*=UTF-8''{encoded}" if is_download else "inline"
-
-    return FileResponse(
-        mp3_path,
-        media_type="audio/mpeg",
-        headers={
-            "Content-Disposition": disposition,
-            "Content-Length": str(file_size),
+        return FileResponse(wav_path, media_type="audio/wav", headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
             "Access-Control-Allow-Origin": "*",
             "Accept-Ranges": "bytes",
-        }
-    )
+        })
+
+    # ── MP3 / stream (player) ─────────────────────────────────────────────────
+    encoded     = urllib.parse.quote(display_name + ".mp3")
+    disposition = "inline" if format == "stream" else f"attachment; filename*=UTF-8''{encoded}"
+    return FileResponse(mp3_path, media_type="audio/mpeg", headers={
+        "Content-Disposition": disposition,
+        "Content-Length":      str(os.path.getsize(mp3_path)),
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+    })
