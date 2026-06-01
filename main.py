@@ -70,15 +70,14 @@ async def split_audio(file: UploadFile = File(...)):
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    output_pattern = f"outputs/{job_id}/track_%03d.mp3"
-    subprocess.run([
-        "ffmpeg", "-i", input_path,
-        "-f", "segment", "-segment_time", "180",
-        "-vn", "-acodec", "libmp3lame",
-        "-ab", "192k", "-ar", "44100", "-y",
-        output_pattern
-    ], check=True)
-
+   output_pattern = "outputs/" + job_id + "/track_%03d.mp3"
+subprocess.run([
+    "ffmpeg", "-i", input_path,
+    "-f", "segment", "-segment_time", "180",
+    "-vn", "-acodec", "mp3",
+    "-ab", "192k", "-ar", "44100", "-y",
+    output_pattern
+], check=True)
     tracks = []
     for i, fname in enumerate(sorted(os.listdir(f"outputs/{job_id}"))):
         if fname.startswith("track_") and fname.endswith(".mp3"):
