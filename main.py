@@ -70,7 +70,7 @@ async def split_audio(file: UploadFile = File(...)):
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-   output_pattern = "outputs/" + job_id + "/track_%03d.mp3"
+output_pattern = "outputs/{}/track_%03d.mp3".format(job_id)
 subprocess.run([
     "ffmpeg", "-i", input_path,
     "-f", "segment", "-segment_time", "180",
