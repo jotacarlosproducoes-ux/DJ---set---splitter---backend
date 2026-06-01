@@ -1,9 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-import uuid, os, shutil
-from pydub import AudioSegment
-from pydub.silence import split_on_silence
+import uuid, os, shutil, subprocess
 
 app = FastAPI()
 
@@ -30,32 +28,25 @@ async def split_audio(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
     os.makedirs(f"outputs/{job_id}", exist_ok=True)
 
-    # Salva o arquivo enviado
-    input_path = f"outputs/{job_id}/input_{file.filename}"
+    input_path = f"outputs/{job_id}/input{os.path.splitext(file.filename)[1]}"
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Carrega e divide por silêncio
-    audio = AudioSegment.from_file(input_path)
-    chunks = split_on_silence(
-        audio,
-        min_silence_len=1500,
-        silence_thresh=audio.dBFS - 16,
-        keep_silence=500
-    )
+    # Divide em partes de 3 minutos usando ffmpeg direto
+    output_pattern = f"outputs/{job_id}/track_%03d.mp3"
+    subprocess.run([
+        "ffmpeg", "-i", input_path,
+        "-f", "segment", "-segment_time", "180",
+        "-c", "copy", output_pattern
+    ], check=True)
 
-    # Se não dividiu (sem silêncio), divide em partes iguais de 3 min
-    if len(chunks) <= 1:
-        chunk_len = 3 * 60 * 1000
-        chunks = [audio[i:i+chunk_len] for i in range(0, len(audio), chunk_len)]
-
-    # Exporta cada faixa
     tracks = []
-    for i, chunk in enumerate(chunks):
-        track_name = f"track_{i+1:02d}.mp3"
-        track_path = f"outputs/{job_id}/{track_name}"
-        chunk.export(track_path, format="mp3")
-        tracks.append({"name": track_name, "url": f"/download/{job_id}/{track_name}"})
+    for fname in sorted(os.listdir(f"outputs/{job_id}")):
+        if fname.startswith("track_") and fname.endswith(".mp3"):
+            tracks.append({
+                "name": fname,
+                "url": f"/download/{job_id}/{fname}"
+            })
 
     jobs[job_id] = {"status": "done", "tracks": tracks}
     return {"job_id": job_id, "status": "done", "tracks": tracks}
