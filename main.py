@@ -34,7 +34,7 @@ class CORSMiddleware(BaseHTTPMiddleware):
 app.add_middleware(CORSMiddleware)
 
 ACR_ACCESS_KEY = "da746b8377796097a8b57b1cb4fe8a5c"
-ACR_ACCESS_SECRET = "Qxt4orcUoVSgkZPP4vfqdYGf4V13Au5j0SKRddl"
+ACR_ACCESS_SECRET = "Qjxt4orcUoVSgkZPP4vfqdYGf4Vl3Au5j0SKRddl"
 ACR_REQURL = "https://identify-us-west-2.acrcloud.com/v1/identify"
 
 jobs = {}
