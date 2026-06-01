@@ -78,7 +78,7 @@ def identify_song(audio_path, timestamp):
             }
             response = requests.post(url, files=files, data=data, timeout=15)
             result = response.json()
-        
+        print(f"ACRCloud response: {result}")
         # Limpa arquivo temporário
         if os.path.exists(sample_path):
             os.remove(sample_path)
