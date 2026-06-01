@@ -42,55 +42,67 @@ jobs = {}
 def identify_song(audio_path, timestamp):
     try:
         url = "https://identify-us-west-2.acrcloud.com/v1/identify"
-        
-        # Pega duração do arquivo para calcular o meio
+
+        # Pega duração do arquivo
         duration_result = os.popen(
             f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
         ).read().strip()
-        
         duration = float(duration_result) if duration_result else 180
-        
-        # Pega amostra do meio da faixa (evita intro/outro do mix)
+
+        # Pega amostra do meio da faixa
         sample_start = max(0, duration / 2 - 10)
         sample_path = audio_path + "_sample.mp3"
-        
         os.system(
             f'ffmpeg -ss {sample_start} -t 20 -i "{audio_path}" -y "{sample_path}" -loglevel quiet'
         )
-        
         sample_file = sample_path if os.path.exists(sample_path) else audio_path
-        
+
+        # Assinatura correta conforme documentação ACRCloud
+        http_method = "POST"
+        http_uri = "/v1/identify"
+        data_type = "audio"
+        signature_version = "1"
         ts = str(int(time.time()))
-        string_to_sign = "POST\n/v1/identify\n" + ACR_KEY + "\naudio\n1\n" + ts
+
+        string_to_sign = "\n".join([http_method, http_uri, ACR_KEY, data_type, signature_version, ts])
+
         sign = base64.b64encode(
-            hmac.new(ACR_SECRET.encode(), string_to_sign.encode(), hashlib.sha1).digest()
-        ).decode()
-        
+            hmac.new(
+                ACR_SECRET.encode("utf-8"),
+                string_to_sign.encode("utf-8"),
+                hashlib.sha1
+            ).digest()
+        ).decode("utf-8")
+
         with open(sample_file, "rb") as f:
+            sample_bytes = os.path.getsize(sample_file)
             files = [("sample", ("sample.mp3", f, "audio/mpeg"))]
             data = {
                 "access_key": ACR_KEY,
-                "sample_bytes": os.path.getsize(sample_file),
+                "sample_bytes": sample_bytes,
                 "timestamp": ts,
                 "signature": sign,
-                "data_type": "audio",
-                "signature_version": "1",
+                "data_type": data_type,
+                "signature_version": signature_version,
             }
             response = requests.post(url, files=files, data=data, timeout=15)
             result = response.json()
+
         print(f"ACRCloud response: {result}")
+
         # Limpa arquivo temporário
         if os.path.exists(sample_path):
             os.remove(sample_path)
-        
+
         if result.get("status", {}).get("code") == 0:
             music = result["metadata"]["music"][0]
             title = music.get("title", "Desconhecida")
             artist = music.get("artists", [{}])[0].get("name", "Desconhecido")
             return {"title": title, "artist": artist}
+
     except Exception as e:
         print(f"ACRCloud error: {e}")
-    
+
     return {"title": "Faixa " + str(timestamp) + "s", "artist": "Desconhecido"}
 
 
