@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import uuid
 import os
@@ -10,9 +10,11 @@ import hmac
 import hashlib
 import base64
 import time
+import urllib.parse
 
 app = FastAPI()
 
+# ─── CORS: permite qualquer origem (necessário para Lovable + preview) ─────────
 class CORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
@@ -29,6 +31,8 @@ class CORSMiddleware(BaseHTTPMiddleware):
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "*"
+        # Necessário para o player de áudio funcionar no browser
+        response.headers["Accept-Ranges"] = "bytes"
         return response
 
 app.add_middleware(CORSMiddleware)
@@ -104,9 +108,8 @@ def identify_song(audio_path, timestamp):
 
 
 def safe_filename(name: str) -> str:
-    """Remove caracteres inválidos mas preserva UTF-8 (ex: Tiësto, é, ü)"""
-    invalid = r'\/:*?"<>|'
-    for ch in invalid:
+    """Preserva UTF-8 (Tiësto, acentos) mas remove caracteres inválidos em nomes de arquivo"""
+    for ch in r'\/:*?"<>|':
         name = name.replace(ch, "_")
     return name.strip()
 
@@ -154,17 +157,17 @@ async def split_audio(file: UploadFile = File(...)):
             ts = i * 180
             info = identify_song(track_path, ts)
             display_name = info["artist"] + " - " + info["title"]
+            track_id = fname.replace(".mp3", "")
             tracks.append({
-                "id": fname.replace(".mp3", ""),   # ex: "track_001"
+                "id": track_id,
                 "name": display_name,
                 "artist": info["artist"],
                 "title": info["title"],
                 "timestamp": ts,
-                # URLs para download — o frontend usa estas
+                # URL sem query string — funciona para player E download
+                "url": "/download/" + job_id + "/" + fname,
                 "url_mp3": "/download/" + job_id + "/" + fname + "?format=mp3",
                 "url_wav": "/download/" + job_id + "/" + fname + "?format=wav",
-                # mantido por compatibilidade com versão anterior
-                "url": "/download/" + job_id + "/" + fname,
             })
             i += 1
 
@@ -182,21 +185,20 @@ def get_status(job_id: str):
 @app.get("/download/{job_id}/{filename}")
 async def download_track(job_id: str, filename: str, format: str = "mp3"):
     """
-    Baixa a faixa em MP3 (padrão) ou WAV.
-    Exemplos:
-      /download/{job_id}/track_001.mp3           → MP3
-      /download/{job_id}/track_001.mp3?format=mp3 → MP3
-      /download/{job_id}/track_001.mp3?format=wav → WAV (converte na hora)
+    Serve o arquivo para player (sem format) ou download (format=mp3/wav).
+    Suporta Range requests para o player de áudio funcionar no browser.
     """
-    # Garante que sempre pegamos o .mp3 base
     base_filename = filename if filename.endswith(".mp3") else filename + ".mp3"
     mp3_path = "outputs/" + job_id + "/" + base_filename
 
     if not os.path.exists(mp3_path):
-        return Response(content='{"error": "Arquivo nao encontrado"}',
-                        status_code=404, media_type="application/json")
+        return Response(
+            content='{"error": "Arquivo nao encontrado"}',
+            status_code=404,
+            media_type="application/json"
+        )
 
-    # Descobre o nome amigável a partir do job
+    # Descobre nome amigável
     display_name = base_filename.replace(".mp3", "")
     if job_id in jobs:
         track_id = base_filename.replace(".mp3", "")
@@ -205,16 +207,14 @@ async def download_track(job_id: str, filename: str, format: str = "mp3"):
                 display_name = safe_filename(t["name"])
                 break
 
+    # ── WAV: converte e serve ──────────────────────────────────────────────────
     if format == "wav":
         wav_path = mp3_path.replace(".mp3", ".wav")
-
-        # Converte só se ainda não existir (cache)
         if not os.path.exists(wav_path):
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-i", mp3_path,
                 "-acodec", "pcm_s16le",
-                "-ar", "44100",
-                "-ac", "2",
+                "-ar", "44100", "-ac", "2",
                 "-y", wav_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
@@ -222,20 +222,38 @@ async def download_track(job_id: str, filename: str, format: str = "mp3"):
             await proc.communicate()
 
         if not os.path.exists(wav_path):
-            return Response(content='{"error": "Falha ao converter para WAV"}',
-                            status_code=500, media_type="application/json")
+            return Response(
+                content='{"error": "Falha ao converter para WAV"}',
+                status_code=500,
+                media_type="application/json"
+            )
 
+        encoded = urllib.parse.quote(display_name + ".wav")
         return FileResponse(
             wav_path,
             media_type="audio/wav",
-            filename=display_name + ".wav",
-            headers={"Content-Disposition": f'attachment; filename*=UTF-8\'\'{display_name}.wav'}
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
+                "Access-Control-Allow-Origin": "*",
+                "Accept-Ranges": "bytes",
+            }
         )
 
-    # Padrão: MP3
+    # ── MP3: serve direto com suporte a Range (necessário para o player) ──────
+    file_size = os.path.getsize(mp3_path)
+    encoded = urllib.parse.quote(display_name + ".mp3")
+
+    # Se for só streaming (player), serve sem forçar download
+    is_download = format == "mp3"
+    disposition = f"attachment; filename*=UTF-8''{encoded}" if is_download else "inline"
+
     return FileResponse(
         mp3_path,
         media_type="audio/mpeg",
-        filename=display_name + ".mp3",
-        headers={"Content-Disposition": f'attachment; filename*=UTF-8\'\'{display_name}.mp3'}
+        headers={
+            "Content-Disposition": disposition,
+            "Content-Length": str(file_size),
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",
+        }
     )
