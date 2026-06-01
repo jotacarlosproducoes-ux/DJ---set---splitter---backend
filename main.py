@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 import uuid
 import os
@@ -33,60 +33,65 @@ class CORSMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(CORSMiddleware)
 
-ACR_HOST = "identify-us-west-2.acrcloud.com"
-ACR_KEY = "da746b8377796097a8b57b1cb4fe8a5c"
-ACR_SECRET = "Qxt4orcUoVSgkZPP4vfqdYGf4V13Au5j0SKRddl"
+ACR_ACCESS_KEY = "da746b8377796097a8b57b1cb4fe8a5c"
+ACR_ACCESS_SECRET = "Qxt4orcUoVSgkZPP4vfqdYGf4V13Au5j0SKRddl"
+ACR_REQURL = "https://identify-us-west-2.acrcloud.com/v1/identify"
 
 jobs = {}
 
 def identify_song(audio_path, timestamp):
+    """Identifica música usando ACRCloud - código baseado no exemplo oficial"""
     try:
-        url = "https://identify-us-west-2.acrcloud.com/v1/identify"
-
-        # Pega duração do arquivo
+        # Pega duração e extrai amostra do meio
         duration_result = os.popen(
             f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
         ).read().strip()
         duration = float(duration_result) if duration_result else 180
-
-        # Pega amostra do meio da faixa
         sample_start = max(0, duration / 2 - 10)
         sample_path = audio_path + "_sample.mp3"
-        os.system(
-            f'ffmpeg -ss {sample_start} -t 20 -i "{audio_path}" -y "{sample_path}" -loglevel quiet'
-        )
+        os.system(f'ffmpeg -ss {sample_start} -t 20 -i "{audio_path}" -y "{sample_path}" -loglevel quiet')
         sample_file = sample_path if os.path.exists(sample_path) else audio_path
 
-        # Assinatura correta conforme documentação ACRCloud
+        # Lê o arquivo
+        with open(sample_file, "rb") as f:
+            sample_bytes = os.path.getsize(sample_file)
+            sample_data = f.read()
+
+        # Assinatura exatamente como o exemplo oficial do ACRCloud
         http_method = "POST"
         http_uri = "/v1/identify"
         data_type = "audio"
         signature_version = "1"
-        ts = str(time.time())
-        string_to_sign = "\n".join([http_method, http_uri, ACR_KEY, data_type, signature_version, ts])
+        timestamp = time.time()
+
+        string_to_sign = http_method + "\n" + \
+                         http_uri + "\n" + \
+                         ACR_ACCESS_KEY + "\n" + \
+                         data_type + "\n" + \
+                         signature_version + "\n" + \
+                         str(timestamp)
 
         sign = base64.b64encode(
             hmac.new(
-                ACR_SECRET.encode("utf-8"),
-                string_to_sign.encode("utf-8"),
-                hashlib.sha1
+                ACR_ACCESS_SECRET.encode('ascii'),
+                string_to_sign.encode('ascii'),
+                digestmod=hashlib.sha1
             ).digest()
-        ).decode("utf-8")
+        ).decode('ascii')
 
-        with open(sample_file, "rb") as f:
-            sample_bytes = os.path.getsize(sample_file)
-            files = [("sample", ("sample.mp3", f, "audio/mpeg"))]
-            data = {
-                "access_key": ACR_KEY,
-                "sample_bytes": sample_bytes,
-                "timestamp": ts,
-                "signature": sign,
-                "data_type": data_type,
-                "signature_version": signature_version,
-            }
-            response = requests.post(url, files=files, data=data, timeout=15)
-            result = response.json()
+        # Envia requisição
+        files = [('sample', ('sample.mp3', sample_data, 'audio/mpeg'))]
+        data = {
+            'access_key': ACR_ACCESS_KEY,
+            'sample_bytes': sample_bytes,
+            'timestamp': str(timestamp),
+            'signature': sign,
+            'data_type': data_type,
+            'signature_version': signature_version,
+        }
 
+        response = requests.post(ACR_REQURL, files=files, data=data, timeout=15)
+        result = response.json()
         print(f"ACRCloud response: {result}")
 
         # Limpa arquivo temporário
@@ -102,7 +107,7 @@ def identify_song(audio_path, timestamp):
     except Exception as e:
         print(f"ACRCloud error: {e}")
 
-    return {"title": "Faixa " + str(timestamp) + "s", "artist": "Desconhecido"}
+    return {"title": "Faixa " + str(int(timestamp)) + "s", "artist": "Desconhecido"}
 
 
 @app.get("/")
@@ -131,12 +136,9 @@ async def split_audio(file: UploadFile = File(...)):
         "ffmpeg", "-i", input_path,
         "-f", "segment",
         "-segment_time", "180",
-        "-vn",
-        "-acodec", "mp3",
-        "-ab", "192k",
-        "-ar", "44100",
-        "-y",
-        output_pattern,
+        "-vn", "-acodec", "mp3",
+        "-ab", "192k", "-ar", "44100",
+        "-y", output_pattern,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
@@ -148,14 +150,14 @@ async def split_audio(file: UploadFile = File(...)):
     for fname in fnames:
         if fname.startswith("track_") and fname.endswith(".mp3"):
             track_path = folder + "/" + fname
-            timestamp = i * 180
-            info = identify_song(track_path, timestamp)
+            ts = i * 180
+            info = identify_song(track_path, ts)
             tracks.append({
                 "name": info["artist"] + " - " + info["title"],
                 "url": "/download/" + job_id + "/" + fname,
                 "artist": info["artist"],
                 "title": info["title"],
-                "timestamp": timestamp
+                "timestamp": ts
             })
             i += 1
 
