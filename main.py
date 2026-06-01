@@ -62,8 +62,7 @@ def identify_song(audio_path, timestamp):
         http_uri = "/v1/identify"
         data_type = "audio"
         signature_version = "1"
-        ts = str(int(time.time()))
-
+        ts = str(time.time())
         string_to_sign = "\n".join([http_method, http_uri, ACR_KEY, data_type, signature_version, ts])
 
         sign = base64.b64encode(
