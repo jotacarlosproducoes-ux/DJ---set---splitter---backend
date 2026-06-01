@@ -40,9 +40,7 @@ ACR_REQURL = "https://identify-us-west-2.acrcloud.com/v1/identify"
 jobs = {}
 
 def identify_song(audio_path, timestamp):
-    """Identifica música usando ACRCloud - código baseado no exemplo oficial"""
     try:
-        # Pega duração e extrai amostra do meio
         duration_result = os.popen(
             f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
         ).read().strip()
@@ -52,24 +50,21 @@ def identify_song(audio_path, timestamp):
         os.system(f'ffmpeg -ss {sample_start} -t 20 -i "{audio_path}" -y "{sample_path}" -loglevel quiet')
         sample_file = sample_path if os.path.exists(sample_path) else audio_path
 
-        # Lê o arquivo
         with open(sample_file, "rb") as f:
             sample_bytes = os.path.getsize(sample_file)
             sample_data = f.read()
 
-        # Assinatura exatamente como o exemplo oficial do ACRCloud
         http_method = "POST"
         http_uri = "/v1/identify"
         data_type = "audio"
         signature_version = "1"
-        timestamp = time.time()
+        ts = time.time()
 
-        string_to_sign = http_method + "\n" + \
-                         http_uri + "\n" + \
-                         ACR_ACCESS_KEY + "\n" + \
-                         data_type + "\n" + \
-                         signature_version + "\n" + \
-                         str(timestamp)
+        string_to_sign = (
+            http_method + "\n" + http_uri + "\n" +
+            ACR_ACCESS_KEY + "\n" + data_type + "\n" +
+            signature_version + "\n" + str(ts)
+        )
 
         sign = base64.b64encode(
             hmac.new(
@@ -79,12 +74,11 @@ def identify_song(audio_path, timestamp):
             ).digest()
         ).decode('ascii')
 
-        # Envia requisição
         files = [('sample', ('sample.mp3', sample_data, 'audio/mpeg'))]
         data = {
             'access_key': ACR_ACCESS_KEY,
             'sample_bytes': sample_bytes,
-            'timestamp': str(timestamp),
+            'timestamp': str(ts),
             'signature': sign,
             'data_type': data_type,
             'signature_version': signature_version,
@@ -94,7 +88,6 @@ def identify_song(audio_path, timestamp):
         result = response.json()
         print(f"ACRCloud response: {result}")
 
-        # Limpa arquivo temporário
         if os.path.exists(sample_path):
             os.remove(sample_path)
 
@@ -108,6 +101,14 @@ def identify_song(audio_path, timestamp):
         print(f"ACRCloud error: {e}")
 
     return {"title": "Faixa " + str(int(timestamp)) + "s", "artist": "Desconhecido"}
+
+
+def safe_filename(name: str) -> str:
+    """Remove caracteres inválidos mas preserva UTF-8 (ex: Tiësto, é, ü)"""
+    invalid = r'\/:*?"<>|'
+    for ch in invalid:
+        name = name.replace(ch, "_")
+    return name.strip()
 
 
 @app.get("/")
@@ -152,12 +153,18 @@ async def split_audio(file: UploadFile = File(...)):
             track_path = folder + "/" + fname
             ts = i * 180
             info = identify_song(track_path, ts)
+            display_name = info["artist"] + " - " + info["title"]
             tracks.append({
-                "name": info["artist"] + " - " + info["title"],
-                "url": "/download/" + job_id + "/" + fname,
+                "id": fname.replace(".mp3", ""),   # ex: "track_001"
+                "name": display_name,
                 "artist": info["artist"],
                 "title": info["title"],
-                "timestamp": ts
+                "timestamp": ts,
+                # URLs para download — o frontend usa estas
+                "url_mp3": "/download/" + job_id + "/" + fname + "?format=mp3",
+                "url_wav": "/download/" + job_id + "/" + fname + "?format=wav",
+                # mantido por compatibilidade com versão anterior
+                "url": "/download/" + job_id + "/" + fname,
             })
             i += 1
 
@@ -173,8 +180,62 @@ def get_status(job_id: str):
 
 
 @app.get("/download/{job_id}/{filename}")
-def download_track(job_id: str, filename: str):
-    path = "outputs/" + job_id + "/" + filename
-    if not os.path.exists(path):
-        return {"error": "Arquivo nao encontrado"}
-    return FileResponse(path, media_type="audio/mpeg", filename=filename)
+async def download_track(job_id: str, filename: str, format: str = "mp3"):
+    """
+    Baixa a faixa em MP3 (padrão) ou WAV.
+    Exemplos:
+      /download/{job_id}/track_001.mp3           → MP3
+      /download/{job_id}/track_001.mp3?format=mp3 → MP3
+      /download/{job_id}/track_001.mp3?format=wav → WAV (converte na hora)
+    """
+    # Garante que sempre pegamos o .mp3 base
+    base_filename = filename if filename.endswith(".mp3") else filename + ".mp3"
+    mp3_path = "outputs/" + job_id + "/" + base_filename
+
+    if not os.path.exists(mp3_path):
+        return Response(content='{"error": "Arquivo nao encontrado"}',
+                        status_code=404, media_type="application/json")
+
+    # Descobre o nome amigável a partir do job
+    display_name = base_filename.replace(".mp3", "")
+    if job_id in jobs:
+        track_id = base_filename.replace(".mp3", "")
+        for t in jobs[job_id].get("tracks", []):
+            if t.get("id") == track_id:
+                display_name = safe_filename(t["name"])
+                break
+
+    if format == "wav":
+        wav_path = mp3_path.replace(".mp3", ".wav")
+
+        # Converte só se ainda não existir (cache)
+        if not os.path.exists(wav_path):
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-i", mp3_path,
+                "-acodec", "pcm_s16le",
+                "-ar", "44100",
+                "-ac", "2",
+                "-y", wav_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+
+        if not os.path.exists(wav_path):
+            return Response(content='{"error": "Falha ao converter para WAV"}',
+                            status_code=500, media_type="application/json")
+
+        return FileResponse(
+            wav_path,
+            media_type="audio/wav",
+            filename=display_name + ".wav",
+            headers={"Content-Disposition": f'attachment; filename*=UTF-8\'\'{display_name}.wav'}
+        )
+
+    # Padrão: MP3
+    return FileResponse(
+        mp3_path,
+        media_type="audio/mpeg",
+        filename=display_name + ".mp3",
+        headers={"Content-Disposition": f'attachment; filename*=UTF-8\'\'{display_name}.mp3'}
+    )
