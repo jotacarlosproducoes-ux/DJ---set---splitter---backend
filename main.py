@@ -37,7 +37,7 @@ async def split_audio(file: UploadFile = File(...)):
     subprocess.run([
         "ffmpeg", "-i", input_path,
         "-f", "segment", "-segment_time", "180",
-        "-c", "copy", output_pattern
+        "-c:a", "libmp3lame", "-q:a", "2", output_pattern
     ], check=True)
 
     tracks = []
