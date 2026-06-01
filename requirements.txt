@@ -3,3 +3,4 @@ uvicorn
 python-multipart
 pydub
 ffmpeg-python
+pyaudioop-compat
