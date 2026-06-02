@@ -6,3 +6,4 @@ librosa
 numpy
 soundfile
 scipy
+boto3
