@@ -7,3 +7,4 @@ numpy
 soundfile
 scipy
 boto3
+redis
