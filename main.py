@@ -91,7 +91,33 @@ def download_from_r2(r2_key: str, local_path: str) -> bool:
         print(f"[R2] Download erro: {e}")
         return False
 
+AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "")
+
 jobs = {}
+
+
+# ─── Identifica música via AudD (fallback) ───────────────────────────────────
+def identify_with_audd(audio_path: str) -> dict | None:
+    """Tenta identificar a música via AudD API."""
+    if not AUDD_API_TOKEN:
+        return None
+    try:
+        with open(audio_path, "rb") as f:
+            resp = requests.post(
+                "https://api.audd.io/",
+                data={"api_token": AUDD_API_TOKEN, "return": "apple_music,spotify"},
+                files={"file": f},
+                timeout=15,
+            )
+        result = resp.json()
+        print(f"AudD response: {result}")
+        if result.get("status") == "success" and result.get("result"):
+            r = result["result"]
+            return {"title": r.get("title", "Desconhecida"),
+                    "artist": r.get("artist", "Desconhecido")}
+    except Exception as e:
+        print(f"AudD error: {e}")
+    return None
 
 
 # ─── Identifica música via ACRCloud ───────────────────────────────────────────
@@ -132,6 +158,12 @@ def identify_song(audio_path, timestamp):
                     "artist": music.get("artists", [{}])[0].get("name", "Desconhecido")}
     except Exception as e:
         print(f"ACRCloud error: {e}")
+    # Fallback: tenta AudD
+    print(f"[ID] ACRCloud sem resultado, tentando AudD...")
+    audd = identify_with_audd(audio_path)
+    if audd:
+        return audd
+
     return {"title": f"Faixa {int(timestamp)}s", "artist": "Desconhecido"}
 
 
