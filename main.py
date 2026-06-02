@@ -1,10 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import FileResponse, Response, RedirectResponse
+from fastapi import FastAPI, UploadFile, File, Request, BackgroundTasks
+from fastapi.responses import FileResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 import uuid, os, shutil, asyncio, requests, hmac, hashlib, base64, time, urllib.parse
 import numpy as np
 import boto3
 from botocore.config import Config
+import redis
 
 app = FastAPI()
 
@@ -29,14 +30,46 @@ app.add_middleware(CORSMiddleware)
 ACR_ACCESS_KEY    = "da746b8377796097a8b57b1cb4fe8a5c"
 ACR_ACCESS_SECRET = "Qjxt4orcUoVSgkZPP4vfqdYGf4Vl3Au5j0SKRddl"
 ACR_REQURL        = "https://identify-us-west-2.acrcloud.com/v1/identify"
+AUDD_API_TOKEN    = os.environ.get("AUDD_API_TOKEN", "")
 
-# ─── Cloudflare R2 ────────────────────────────────────────────────────────────
 R2_ACCESS_KEY_ID     = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_ENDPOINT          = os.environ.get("R2_ENDPOINT", "")
 R2_BUCKET            = os.environ.get("R2_BUCKET", "djsetsplitter")
-R2_PUBLIC_URL        = os.environ.get("R2_PUBLIC_URL", "")  # opcional
+REDIS_URL            = os.environ.get("REDIS_URL", "")
 
+# ─── Redis ────────────────────────────────────────────────────────────────────
+def get_redis():
+    if not REDIS_URL:
+        return None
+    try:
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        r.ping()
+        return r
+    except Exception as e:
+        print(f"[REDIS] Erro: {e}")
+        return None
+
+def job_set(job_id: str, data: dict):
+    r = get_redis()
+    if r:
+        import json
+        r.setex(f"job:{job_id}", 86400, json.dumps(data))  # expira em 24h
+    else:
+        jobs[job_id] = data
+
+def job_get(job_id: str) -> dict | None:
+    r = get_redis()
+    if r:
+        import json
+        val = r.get(f"job:{job_id}")
+        return json.loads(val) if val else None
+    return jobs.get(job_id)
+
+# Fallback local se Redis não disponível
+jobs = {}
+
+# ─── R2 ───────────────────────────────────────────────────────────────────────
 def get_r2():
     if not R2_ACCESS_KEY_ID or not R2_ENDPOINT:
         return None
@@ -50,7 +83,6 @@ def get_r2():
     )
 
 def upload_to_r2(local_path: str, r2_key: str) -> bool:
-    """Faz upload de um arquivo local para o R2."""
     try:
         s3 = get_r2()
         if not s3:
@@ -62,24 +94,7 @@ def upload_to_r2(local_path: str, r2_key: str) -> bool:
         print(f"[R2] Upload erro: {e}")
         return False
 
-def get_r2_presigned_url(r2_key: str, expires: int = 3600) -> str | None:
-    """Gera URL temporária (1h) para download direto do R2."""
-    try:
-        s3 = get_r2()
-        if not s3:
-            return None
-        url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": R2_BUCKET, "Key": r2_key},
-            ExpiresIn=expires,
-        )
-        return url
-    except Exception as e:
-        print(f"[R2] Presigned URL erro: {e}")
-        return None
-
 def download_from_r2(r2_key: str, local_path: str) -> bool:
-    """Baixa arquivo do R2 para disco local (para processar)."""
     try:
         s3 = get_r2()
         if not s3:
@@ -91,14 +106,9 @@ def download_from_r2(r2_key: str, local_path: str) -> bool:
         print(f"[R2] Download erro: {e}")
         return False
 
-AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "")
 
-jobs = {}
-
-
-# ─── Identifica música via AudD (fallback) ───────────────────────────────────
+# ─── AudD fallback ────────────────────────────────────────────────────────────
 def identify_with_audd(audio_path: str) -> dict | None:
-    """Tenta identificar a música via AudD API."""
     if not AUDD_API_TOKEN:
         return None
     try:
@@ -110,7 +120,7 @@ def identify_with_audd(audio_path: str) -> dict | None:
                 timeout=15,
             )
         result = resp.json()
-        print(f"AudD response: {result}")
+        print(f"AudD: {result}")
         if result.get("status") == "success" and result.get("result"):
             r = result["result"]
             return {"title": r.get("title", "Desconhecida"),
@@ -120,7 +130,7 @@ def identify_with_audd(audio_path: str) -> dict | None:
     return None
 
 
-# ─── Identifica música via ACRCloud ───────────────────────────────────────────
+# ─── ACRCloud ────────────────────────────────────────────────────────────────
 def identify_song(audio_path, timestamp):
     try:
         duration_result = os.popen(
@@ -158,8 +168,9 @@ def identify_song(audio_path, timestamp):
                     "artist": music.get("artists", [{}])[0].get("name", "Desconhecido")}
     except Exception as e:
         print(f"ACRCloud error: {e}")
-    # Fallback: tenta AudD
-    print(f"[ID] ACRCloud sem resultado, tentando AudD...")
+
+    # Fallback AudD
+    print("[ID] ACRCloud sem resultado, tentando AudD...")
     audd = identify_with_audd(audio_path)
     if audd:
         return audd
@@ -167,7 +178,7 @@ def identify_song(audio_path, timestamp):
     return {"title": f"Faixa {int(timestamp)}s", "artist": "Desconhecido"}
 
 
-# ─── Extensão inteligente de faixa ───────────────────────────────────────────
+# ─── Extensão inteligente ────────────────────────────────────────────────────
 def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60) -> bool:
     try:
         import librosa
@@ -247,10 +258,60 @@ def safe_filename(name: str) -> str:
     return name.strip()
 
 
+# ─── Processamento em background ─────────────────────────────────────────────
+def process_job(job_id: str, input_path: str, folder: str):
+    """Processa o job em background — divide, identifica e salva no R2."""
+    try:
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 0})
+
+        output_pattern = folder + "/track_%03d.mp3"
+        os.system(
+            f'ffmpeg -i "{input_path}" -f segment -segment_time 180 '
+            f'-vn -acodec mp3 -ab 192k -ar 44100 -y "{output_pattern}" -loglevel quiet'
+        )
+
+        fnames = sorted(f for f in os.listdir(folder)
+                        if f.startswith("track_") and f.endswith(".mp3"))
+        total  = len(fnames)
+        tracks = []
+
+        for i, fname in enumerate(fnames):
+            track_path   = folder + "/" + fname
+            ts           = i * 180
+            info         = identify_song(track_path, ts)
+            display_name = info["artist"] + " - " + info["title"]
+            track_id     = fname.replace(".mp3", "")
+
+            r2_key = f"{job_id}/{fname}"
+            upload_to_r2(track_path, r2_key)
+
+            tracks.append({
+                "id":           track_id,
+                "name":         display_name,
+                "artist":       info["artist"],
+                "title":        info["title"],
+                "timestamp":    ts,
+                "url":          f"/download/{job_id}/{fname}",
+                "url_mp3":      f"/download/{job_id}/{fname}?format=mp3",
+                "url_wav":      f"/download/{job_id}/{fname}?format=wav",
+                "url_extended": f"/download/{job_id}/{fname}?format=extended",
+            })
+
+            progress = int((i + 1) / total * 100)
+            job_set(job_id, {"status": "processing", "tracks": tracks, "progress": progress})
+
+        job_set(job_id, {"status": "done", "tracks": tracks, "progress": 100})
+        print(f"[JOB] {job_id} concluído — {total} faixas")
+
+    except Exception as e:
+        print(f"[JOB] Erro: {e}")
+        job_set(job_id, {"status": "error", "error": str(e), "tracks": []})
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "DJ Set Splitter API online", "r2": bool(R2_ACCESS_KEY_ID)}
+    return {"status": "DJ Set Splitter API online", "r2": bool(R2_ACCESS_KEY_ID), "redis": bool(REDIS_URL)}
 
 @app.get("/health")
 def health():
@@ -258,7 +319,8 @@ def health():
 
 
 @app.post("/split")
-async def split_audio(file: UploadFile = File(...)):
+async def split_audio(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Recebe o arquivo e inicia o processamento em background imediatamente."""
     job_id = str(uuid.uuid4())
     folder = "outputs/" + job_id
     os.makedirs(folder, exist_ok=True)
@@ -267,49 +329,19 @@ async def split_audio(file: UploadFile = File(...)):
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-i", input_path,
-        "-f", "segment", "-segment_time", "180",
-        "-vn", "-acodec", "mp3", "-ab", "192k", "-ar", "44100",
-        "-y", folder + "/track_%03d.mp3",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    await proc.communicate()
+    # Inicia processamento em background
+    job_set(job_id, {"status": "processing", "tracks": [], "progress": 0})
+    background_tasks.add_task(process_job, job_id, input_path, folder)
 
-    tracks = []
-    for i, fname in enumerate(sorted(f for f in os.listdir(folder)
-                                     if f.startswith("track_") and f.endswith(".mp3"))):
-        track_path   = folder + "/" + fname
-        ts           = i * 180
-        info         = identify_song(track_path, ts)
-        display_name = info["artist"] + " - " + info["title"]
-        track_id     = fname.replace(".mp3", "")
-
-        # Upload para R2
-        r2_key = f"{job_id}/{fname}"
-        upload_to_r2(track_path, r2_key)
-
-        tracks.append({
-            "id":           track_id,
-            "name":         display_name,
-            "artist":       info["artist"],
-            "title":        info["title"],
-            "timestamp":    ts,
-            "url":          f"/download/{job_id}/{fname}",
-            "url_mp3":      f"/download/{job_id}/{fname}?format=mp3",
-            "url_wav":      f"/download/{job_id}/{fname}?format=wav",
-            "url_extended": f"/download/{job_id}/{fname}?format=extended",
-        })
-
-    jobs[job_id] = {"status": "done", "tracks": tracks}
-    return {"job_id": job_id, "status": "done", "tracks": tracks}
+    return {"job_id": job_id, "status": "processing"}
 
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    if job_id not in jobs:
+    data = job_get(job_id)
+    if not data:
         return {"error": "Job nao encontrado"}
-    return jobs[job_id]
+    return data
 
 
 @app.get("/download/{job_id}/{filename}")
@@ -318,9 +350,7 @@ async def download_track(job_id: str, filename: str, format: str = "stream"):
     mp3_path      = f"outputs/{job_id}/{base_filename}"
     r2_key        = f"{job_id}/{base_filename}"
 
-    # Se não existe localmente, tenta buscar do R2
     if not os.path.exists(mp3_path):
-        print(f"[R2] Arquivo não encontrado localmente, buscando do R2: {r2_key}")
         ok = download_from_r2(r2_key, mp3_path)
         if not ok:
             return Response(content='{"error":"Arquivo nao encontrado"}',
@@ -328,8 +358,9 @@ async def download_track(job_id: str, filename: str, format: str = "stream"):
 
     # Nome amigável
     display_name = base_filename.replace(".mp3", "")
-    if job_id in jobs:
-        for t in jobs[job_id].get("tracks", []):
+    data = job_get(job_id)
+    if data:
+        for t in data.get("tracks", []):
             if t.get("id") == base_filename.replace(".mp3", ""):
                 display_name = safe_filename(t["name"])
                 break
@@ -340,7 +371,6 @@ async def download_track(job_id: str, filename: str, format: str = "stream"):
         ext_r2key = r2_key.replace(".mp3", "_extended.mp3")
 
         if not os.path.exists(ext_path):
-            # Tenta buscar do R2 primeiro (cache)
             download_from_r2(ext_r2key, ext_path)
 
         if not os.path.exists(ext_path):
@@ -349,7 +379,6 @@ async def download_track(job_id: str, filename: str, format: str = "stream"):
             if not ok:
                 return Response(content='{"error":"Falha ao gerar versao estendida"}',
                                 status_code=500, media_type="application/json")
-            # Salva no R2 para próximas requisições
             upload_to_r2(ext_path, ext_r2key)
 
         encoded = urllib.parse.quote(display_name + "_extended.mp3")
