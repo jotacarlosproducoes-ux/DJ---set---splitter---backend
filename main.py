@@ -105,26 +105,42 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
 
         # 3. Detecta BPM e batidas
         tempo, beats = librosa.beat.beat_track(y=y_mono, sr=sr)
-        beat_frames  = librosa.frames_to_samples(beats)
-        print("[EXTEND] BPM detectado: " + str(round(float(tempo), 1)))
+        # Garante que tempo é escalar Python
+        tempo_val = float(np.array(tempo).flatten()[0])
+        print("[EXTEND] BPM detectado: " + str(round(tempo_val, 1)))
+
+        # Converte frames para samples e garante array 1D de ints Python
+        beat_frames = [int(x) for x in librosa.frames_to_samples(np.array(beats).flatten())]
+
+        if len(beat_frames) < 4:
+            print("[EXTEND] Poucas batidas detectadas, usando segmentação por tempo")
+            # Fallback: divide em segmentos de 30s
+            seg_len = int(sr * 30)
+            total   = y_mono.shape[0]
+            beat_frames = list(range(0, total, seg_len))
 
         # 4. Divide em segmentos de 8 compassos (32 batidas)
-        beats_per_segment = 32
+        beats_per_segment = min(32, max(4, len(beat_frames) // 4))
         segments = []
         for i in range(0, len(beat_frames) - beats_per_segment, beats_per_segment):
-            start = beat_frames[i]
-            end   = beat_frames[min(i + beats_per_segment, len(beat_frames) - 1)]
-            seg   = y_mono[start:end]
+            start  = int(beat_frames[i])
+            end    = int(beat_frames[min(i + beats_per_segment, len(beat_frames) - 1)])
+            if end <= start:
+                continue
+            seg    = y_mono[start:end]
             energy = float(np.mean(seg ** 2))
             segments.append({"start": start, "end": end, "energy": energy, "index": i})
 
         if not segments:
-            os.remove(tmp_wav)
-            return False
+            # Fallback: usa a metade central da faixa
+            mid   = y_mono.shape[0] // 2
+            start = mid - int(sr * 30)
+            end   = mid + int(sr * 30)
+            segments = [{"start": max(0, start), "end": min(y_mono.shape[0], end), "energy": 1.0, "index": 0}]
 
         # 5. Segmento de maior energia = drop/refrão
         best = max(segments, key=lambda s: s["energy"])
-        print(f"[EXTEND] Melhor segmento: {best['start']/sr:.1f}s – {best['end']/sr:.1f}s")
+        print("[EXTEND] Melhor segmento: " + str(round(best['start']/sr, 1)) + "s – " + str(round(best['end']/sr, 1)) + "s")
 
         # 6. Monta versão estendida:
         #    [original completa] + [crossfade] + [segmento do drop repetido]
