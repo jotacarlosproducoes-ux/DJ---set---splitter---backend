@@ -106,7 +106,7 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
         # 3. Detecta BPM e batidas
         tempo, beats = librosa.beat.beat_track(y=y_mono, sr=sr)
         beat_frames  = librosa.frames_to_samples(beats)
-        print(f"[EXTEND] BPM detectado: {tempo:.1f}")
+        print("[EXTEND] BPM detectado: " + str(round(float(tempo), 1)))
 
         # 4. Divide em segmentos de 8 compassos (32 batidas)
         beats_per_segment = 32
