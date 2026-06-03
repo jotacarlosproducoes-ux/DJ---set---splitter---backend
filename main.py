@@ -348,30 +348,160 @@ def safe_filename(name: str) -> str:
     return name.strip()
 
 
+# ─── Detecção inteligente de transições ─────────────────────────────────────
+def detect_transitions(audio_path: str, min_track_duration: float = 90.0) -> list:
+    """
+    Detecta os pontos exatos onde uma música termina e outra começa no set do DJ.
+    Usa análise espectral de novidade (novelty) para encontrar transições.
+    Retorna lista de timestamps em segundos.
+    """
+    try:
+        import librosa
+
+        print("[SPLIT] Carregando áudio para análise espectral...")
+        y, sr = librosa.load(audio_path, sr=22050, mono=True)  # 22050 Hz suficiente para análise
+        duration = len(y) / sr
+        print(f"[SPLIT] Duração total: {round(duration/60, 1)} minutos")
+
+        # 1. Calcula chroma e MFCC para detectar mudanças harmônicas
+        hop_length = 512
+        chroma     = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+        mfcc       = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
+        rms        = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+
+        # 2. Calcula novidade espectral — picos = transições
+        # Chroma novelty (mudanças harmônicas)
+        chroma_diff = np.sum(np.abs(np.diff(chroma, axis=1)), axis=0)
+        # MFCC novelty (mudanças timbrais)
+        mfcc_diff   = np.sum(np.abs(np.diff(mfcc, axis=1)), axis=0)
+        # Combina os dois sinais
+        min_len  = min(len(chroma_diff), len(mfcc_diff))
+        novelty  = chroma_diff[:min_len] * 0.6 + mfcc_diff[:min_len] * 0.4
+
+        # 3. Suaviza o sinal de novidade
+        from scipy.ndimage import uniform_filter1d
+        novelty_smooth = uniform_filter1d(novelty, size=int(sr * 5 / hop_length))  # janela de 5s
+
+        # 4. Normaliza
+        if novelty_smooth.max() > 0:
+            novelty_smooth = novelty_smooth / novelty_smooth.max()
+
+        # 5. Detecta picos acima do threshold
+        from scipy.signal import find_peaks
+        min_samples_between = int(min_track_duration * sr / hop_length)
+        peaks, props = find_peaks(
+            novelty_smooth,
+            height=0.35,           # threshold — só picos significativos
+            distance=min_samples_between,
+            prominence=0.15
+        )
+
+        # Converte frames para segundos
+        frame_times = librosa.frames_to_time(np.arange(len(novelty_smooth)),
+                                              sr=sr, hop_length=hop_length)
+        transition_times = [float(frame_times[p]) for p in peaks]
+
+        # Filtra transições muito próximas do início ou fim
+        transition_times = [t for t in transition_times
+                           if t > min_track_duration and t < duration - min_track_duration]
+
+        print(f"[SPLIT] {len(transition_times)} transições detectadas: {[round(t,1) for t in transition_times]}")
+        return transition_times
+
+    except Exception as e:
+        print(f"[SPLIT] Erro na detecção: {e}")
+        return []
+
+
+def split_by_transitions(input_path: str, folder: str, transitions: list) -> list:
+    """
+    Divide o áudio nos pontos de transição detectados.
+    Retorna lista de caminhos dos arquivos gerados.
+    """
+    import subprocess
+
+    # Obtém duração total
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        capture_output=True, text=True
+    )
+    total_duration = float(result.stdout.strip()) if result.stdout.strip() else 0
+
+    # Monta lista de segmentos: (start, end)
+    boundaries = [0.0] + transitions + [total_duration]
+    segments = [(boundaries[i], boundaries[i+1]) for i in range(len(boundaries)-1)]
+
+    print(f"[SPLIT] Dividindo em {len(segments)} segmentos")
+
+    track_paths = []
+    for i, (start, end) in enumerate(segments):
+        duration = end - start
+        if duration < 30:  # ignora segmentos muito curtos
+            print(f"[SPLIT] Segmento {i} muito curto ({round(duration,1)}s), ignorando")
+            continue
+
+        out_path = os.path.join(folder, f"track_{i:03d}.mp3")
+        ret = os.system(
+            f'ffmpeg -ss {start} -t {duration} -i "{input_path}" '
+            f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{out_path}" -loglevel quiet'
+        )
+        if ret == 0 and os.path.exists(out_path):
+            track_paths.append(out_path)
+            print(f"[SPLIT] Faixa {i+1}: {round(start/60,1)}min → {round(end/60,1)}min ({round(duration/60,1)}min)")
+
+    return track_paths
+
+
 # ─── Processamento em background ─────────────────────────────────────────────
 def process_job(job_id: str, input_path: str, folder: str):
-    """Processa o job em background — divide, identifica e salva no R2."""
+    """Processa o job em background — detecta transições, divide, identifica e salva no R2."""
     try:
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 0})
 
-        output_pattern = folder + "/track_%03d.mp3"
-        os.system(
-            f'ffmpeg -i "{input_path}" -f segment -segment_time 180 '
-            f'-vn -acodec mp3 -ab 192k -ar 44100 -y "{output_pattern}" -loglevel quiet'
-        )
+        # 1. Detecta transições inteligentes
+        print(f"[JOB] {job_id} — detectando transições...")
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
+                         "stage": "Analisando espectro sonoro..."})
+        transitions = detect_transitions(input_path, min_track_duration=90.0)
 
-        fnames = sorted(f for f in os.listdir(folder)
-                        if f.startswith("track_") and f.endswith(".mp3"))
-        total  = len(fnames)
+        # 2. Divide nos pontos corretos
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 20,
+                         "stage": f"{len(transitions)} transições detectadas — dividindo faixas..."})
+        track_paths = split_by_transitions(input_path, folder, transitions)
+
+        # Fallback: se não detectou nenhuma transição, divide em 3 minutos
+        if not track_paths:
+            print("[JOB] Nenhuma transição detectada, usando divisão por tempo")
+            job_set(job_id, {"status": "processing", "tracks": [], "progress": 20,
+                             "stage": "Usando divisão automática..."})
+            output_pattern = folder + "/track_%03d.mp3"
+            os.system(
+                f'ffmpeg -i "{input_path}" -f segment -segment_time 180 '
+                f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{output_pattern}" -loglevel quiet'
+            )
+            track_paths = sorted(
+                os.path.join(folder, f) for f in os.listdir(folder)
+                if f.startswith("track_") and f.endswith(".mp3")
+            )
+
+        total = len(track_paths)
         tracks = []
 
-        for i, fname in enumerate(fnames):
-            track_path   = folder + "/" + fname
-            ts           = i * 180
+        # 3. Identifica cada faixa
+        for i, track_path in enumerate(sorted(track_paths)):
+            fname    = os.path.basename(track_path)
+            track_id = fname.replace(".mp3", "")
+            ts       = i * 180
+
+            progress = 20 + int((i / total) * 70)
+            job_set(job_id, {"status": "processing", "tracks": tracks, "progress": progress,
+                             "stage": f"Identificando faixa {i+1} de {total}..."})
+
             info         = identify_song(track_path, ts)
             display_name = info["artist"] + " - " + info["title"]
-            track_id     = fname.replace(".mp3", "")
 
+            # Upload para R2
             r2_key = f"{job_id}/{fname}"
             upload_to_r2(track_path, r2_key)
 
@@ -387,14 +517,14 @@ def process_job(job_id: str, input_path: str, folder: str):
                 "url_extended": f"/download/{job_id}/{fname}?format=extended",
             })
 
-            progress = int((i + 1) / total * 100)
-            job_set(job_id, {"status": "processing", "tracks": tracks, "progress": progress})
-
-        job_set(job_id, {"status": "done", "tracks": tracks, "progress": 100})
+        job_set(job_id, {"status": "done", "tracks": tracks, "progress": 100,
+                         "stage": "Concluído!"})
         print(f"[JOB] {job_id} concluído — {total} faixas")
 
     except Exception as e:
         print(f"[JOB] Erro: {e}")
+        import traceback
+        traceback.print_exc()
         job_set(job_id, {"status": "error", "error": str(e), "tracks": []})
 
 
