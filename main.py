@@ -268,18 +268,24 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
                 s, e = best_seg
                 loop_audio = y[:, s:e]
 
-                # Crossfade longo de 8s para junção imperceptível
-                fade_len = min(int(sr * 8), loop_audio.shape[1] // 3)
-                fade_in  = np.linspace(0.0, 1.0, fade_len) ** 2  # curva suave
-                fade_out = np.linspace(1.0, 0.0, fade_len) ** 2
-
-                loop_faded = loop_audio.copy()
-                loop_faded[:, :fade_len]  *= fade_in
-                loop_faded[:, -fade_len:] *= fade_out
+                # Crossfade sobreposto — nunca chega a zero, como um DJ
+                fade_len = min(int(sr * 6), loop_audio.shape[1] // 4)
+                fade_in  = np.linspace(0.0, 1.0, fade_len) ** 0.5
+                fade_out = np.linspace(1.0, 0.0, fade_len) ** 0.5
 
                 seg_dur = loop_audio.shape[1] / sr
                 reps    = max(1, int(np.ceil(target_extra_seconds / seg_dur)))
-                extended_stems[stem_name] = np.concatenate([y] + [loop_faded] * reps, axis=1)
+
+                stem_result = y.copy()
+                for _ in range(reps):
+                    loop = loop_audio.copy()
+                    overlap = fade_len
+                    stem_result[:, -overlap:] *= fade_out
+                    loop[:, :overlap]         *= fade_in
+                    stem_result[:, -overlap:] += loop[:, :overlap]
+                    stem_result = np.concatenate([stem_result, loop[:, overlap:]], axis=1)
+
+                extended_stems[stem_name] = stem_result
 
             # 4. Garante que todos os stems têm o mesmo tamanho
             min_len = min(s.shape[1] for s in extended_stems.values())
@@ -334,13 +340,22 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
             fade_in    = np.linspace(0.0, 1.0, fade_len) ** 2
             fade_out   = np.linspace(1.0, 0.0, fade_len) ** 2
 
-            loop_faded = loop_audio.copy()
-            loop_faded[:, :fade_len]  *= fade_in
-            loop_faded[:, -fade_len:] *= fade_out
+            seg_dur = loop_audio.shape[1] / sr
+            reps    = max(1, int(np.ceil(target_extra_seconds / seg_dur)))
 
-            seg_dur  = loop_audio.shape[1] / sr
-            reps     = max(1, int(np.ceil(target_extra_seconds / seg_dur)))
-            combined = np.concatenate([y] + [loop_faded] * reps, axis=1)
+            # Crossfade sobreposto — nunca chega a zero
+            fade_len = min(int(sr * 6), loop_audio.shape[1] // 4)
+            fade_in  = np.linspace(0.0, 1.0, fade_len) ** 0.5
+            fade_out = np.linspace(1.0, 0.0, fade_len) ** 0.5
+
+            combined = y.copy()
+            for _ in range(reps):
+                loop = loop_audio.copy()
+                overlap = fade_len
+                combined[:, -overlap:] *= fade_out
+                loop[:, :overlap]      *= fade_in
+                combined[:, -overlap:] += loop[:, :overlap]
+                combined = np.concatenate([combined, loop[:, overlap:]], axis=1)
 
             peak = np.max(np.abs(combined))
             if peak > 0.95:
