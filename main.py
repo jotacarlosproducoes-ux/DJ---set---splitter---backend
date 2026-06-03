@@ -5,7 +5,6 @@ import uuid, os, shutil, asyncio, requests, hmac, hashlib, base64, time, urllib.
 import numpy as np
 import boto3
 from botocore.config import Config
-import redis
 
 app = FastAPI()
 
@@ -36,7 +35,6 @@ R2_ACCESS_KEY_ID     = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_ENDPOINT          = os.environ.get("R2_ENDPOINT", "")
 R2_BUCKET            = os.environ.get("R2_BUCKET", "djsetsplitter")
-REDIS_URL            = os.environ.get("REDIS_URL", "")
 
 # ─── Job storage (arquivo JSON — simples e confiável) ────────────────────────
 JOBS_DIR = "jobs"
@@ -529,7 +527,7 @@ def process_job(job_id: str, input_path: str, folder: str):
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "DJ Set Splitter API online", "r2": bool(R2_ACCESS_KEY_ID), "redis": bool(REDIS_URL)}
+    return {"status": "DJ Set Splitter API online", "r2": bool(R2_ACCESS_KEY_ID), "storage": "json"}
 
 @app.get("/health")
 def health():
