@@ -36,7 +36,7 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_ENDPOINT          = os.environ.get("R2_ENDPOINT", "")
 R2_BUCKET            = os.environ.get("R2_BUCKET", "djsetsplitter")
 
-# ─── Job storage (arquivo JSON — simples e confiável) ────────────────────────
+# ─── Job storage ─────────────────────────────────────────────────────────────
 JOBS_DIR = "jobs"
 os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -59,11 +59,6 @@ def job_get(job_id: str) -> dict | None:
     except Exception as e:
         print(f"[JOB] Erro ao ler job: {e}")
     return None
-
-def get_redis():
-    return None
-
-jobs = {}
 
 # ─── R2 ───────────────────────────────────────────────────────────────────────
 def get_r2():
@@ -102,8 +97,13 @@ def download_from_r2(r2_key: str, local_path: str) -> bool:
         print(f"[R2] Download erro: {e}")
         return False
 
+def safe_filename(name: str) -> str:
+    for ch in r'\/:*?"<>|':
+        name = name.replace(ch, "_")
+    return name.strip()
 
-# ─── AudD fallback ────────────────────────────────────────────────────────────
+
+# ─── Identificação de música (só para nomear, não para cortar) ───────────────
 def identify_with_audd(audio_path: str) -> dict | None:
     if not AUDD_API_TOKEN:
         return None
@@ -116,7 +116,6 @@ def identify_with_audd(audio_path: str) -> dict | None:
                 timeout=15,
             )
         result = resp.json()
-        print(f"AudD: {result}")
         if result.get("status") == "success" and result.get("result"):
             r = result["result"]
             return {"title": r.get("title", "Desconhecida"),
@@ -125,9 +124,8 @@ def identify_with_audd(audio_path: str) -> dict | None:
         print(f"AudD error: {e}")
     return None
 
-
-# ─── ACRCloud ────────────────────────────────────────────────────────────────
-def identify_song(audio_path, timestamp):
+def identify_song(audio_path: str, timestamp: float) -> dict:
+    """Identifica uma música usando ACRCloud + AudD fallback."""
     try:
         duration_result = os.popen(
             f'ffprobe -v error -show_entries format=duration '
@@ -155,7 +153,7 @@ def identify_song(audio_path, timestamp):
                                      'timestamp': str(ts), 'signature': sign,
                                      'data_type': 'audio', 'signature_version': '1'})
         result = resp.json()
-        print(f"ACRCloud: {result}")
+        print(f"ACRCloud: {result.get('status', {}).get('msg')} @ {round(timestamp)}s")
         if os.path.exists(sample_path):
             os.remove(sample_path)
         if result.get("status", {}).get("code") == 0:
@@ -165,8 +163,6 @@ def identify_song(audio_path, timestamp):
     except Exception as e:
         print(f"ACRCloud error: {e}")
 
-    # Fallback AudD
-    print("[ID] ACRCloud sem resultado, tentando AudD...")
     audd = identify_with_audd(audio_path)
     if audd:
         return audd
@@ -174,17 +170,306 @@ def identify_song(audio_path, timestamp):
     return {"title": f"Faixa {int(timestamp)}s", "artist": "Desconhecido"}
 
 
-# ─── Extensão profissional com Demucs (Meta AI) ─────────────────────────────
+# ─── DETECÇÃO DE TRANSIÇÕES — Análise espectral pura ─────────────────────────
+def detect_transitions_spectral(audio_path: str, min_track_duration: float = 90.0) -> list[float]:
+    """
+    Detecta transições de músicas em um DJ set usando análise espectral pura.
+    NÃO depende de APIs externas para decidir os cortes.
+
+    Algoritmo:
+    1. Carrega o áudio em baixa resolução (11025Hz mono) para eficiência
+    2. Calcula 4 features por frame (~0.5s cada):
+       - RMS energy normalizada
+       - Spectral centroid (brilho do som)
+       - Spectral rolloff (distribuição de energia nas frequências)
+       - Zero-crossing rate (rugosidade do sinal)
+    3. Calcula a "distância espectral" entre janelas de 30s consecutivas
+       usando correlação cruzada — detecta quando o CARÁTER do áudio muda
+    4. Identifica zonas de transição (onde duas músicas se sobrepõem):
+       - RMS cresce enquanto espectro muda = DJ está fazendo a mix
+    5. Para cada zona de transição, encontra o ponto de DOMINÂNCIA:
+       o exato momento em que a nova música supera a anterior em energia
+    6. Alinha o corte ao beat mais próximo (usando beat tracking)
+    7. Aplica trim para limpar início/fim de cada faixa
+
+    Retorna lista de timestamps (em segundos) onde fazer os cortes.
+    """
+    try:
+        import librosa
+        from scipy.ndimage import uniform_filter1d, label
+        from scipy.signal import find_peaks
+
+        SR        = 11025   # baixa resolução — suficiente para análise de transições
+        HOP       = int(SR * 0.5)   # 1 frame = 0.5s
+        WIN       = int(SR * 2)     # janela de análise = 2s
+
+        print(f"[DETECT] Carregando {audio_path}...")
+        y, sr = librosa.load(audio_path, sr=SR, mono=True, res_type="kaiser_fast")
+        total_duration = len(y) / sr
+        print(f"[DETECT] Duração: {round(total_duration/60, 1)} min")
+
+        if total_duration < min_track_duration * 2:
+            print("[DETECT] Áudio muito curto para ter transições")
+            return []
+
+        # ── 1. Features espectrais por frame ─────────────────────────────────
+        rms       = librosa.feature.rms(y=y, hop_length=HOP, frame_length=WIN)[0]
+        centroid  = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP, n_fft=WIN)[0]
+        rolloff   = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=HOP, n_fft=WIN)[0]
+        zcr       = librosa.feature.zero_crossing_rate(y=y, hop_length=HOP, frame_length=WIN)[0]
+
+        n_frames = min(len(rms), len(centroid), len(rolloff), len(zcr))
+        rms      = rms[:n_frames]
+        centroid = centroid[:n_frames]
+        rolloff  = rolloff[:n_frames]
+        zcr      = zcr[:n_frames]
+
+        def smooth_normalize(x, smooth_frames=20):
+            x = uniform_filter1d(x.astype(float), size=smooth_frames)
+            mn, mx = x.min(), x.max()
+            return (x - mn) / (mx - mn + 1e-9)
+
+        rms_n      = smooth_normalize(rms, smooth_frames=6)   # pouca suavização — queremos ver variações
+        centroid_n = smooth_normalize(centroid)
+        rolloff_n  = smooth_normalize(rolloff)
+        zcr_n      = smooth_normalize(zcr)
+
+        # ── 2. Distância espectral entre janelas de 60s ───────────────────────
+        # Compara o "perfil espectral" de janelas de 60s com as próximas 60s
+        # Uma mudança grande = transição de música
+        window_frames = int(60 / 0.5)   # 60s em frames
+        n = n_frames
+
+        spectral_change = np.zeros(n)
+        for i in range(window_frames, n - window_frames):
+            # Janela anterior vs janela posterior
+            prev = np.array([
+                centroid_n[i - window_frames:i].mean(),
+                rolloff_n[i - window_frames:i].mean(),
+                zcr_n[i - window_frames:i].mean(),
+            ])
+            nxt = np.array([
+                centroid_n[i:i + window_frames].mean(),
+                rolloff_n[i:i + window_frames].mean(),
+                zcr_n[i:i + window_frames].mean(),
+            ])
+            spectral_change[i] = float(np.linalg.norm(nxt - prev))
+
+        spectral_change = smooth_normalize(spectral_change, smooth_frames=10)
+
+        # ── 3. Score de transição ─────────────────────────────────────────────
+        # Transição = mudança espectral alta + energia em nível razoável
+        # (não é silêncio, mas também não é pico — é a zona de mix)
+        rms_mid = 1.0 - np.abs(rms_n - 0.5) * 2   # máximo quando RMS está no meio
+        transition_score = spectral_change * 0.7 + rms_mid * 0.3
+        transition_score = smooth_normalize(transition_score, smooth_frames=4)
+
+        # ── 4. Detecta picos de transição ────────────────────────────────────
+        min_dist_frames = int(min_track_duration / 0.5)
+
+        peaks, props = find_peaks(
+            transition_score,
+            height=0.35,
+            distance=min_dist_frames,
+            prominence=0.15,
+        )
+
+        frame_times = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=HOP)
+
+        print(f"[DETECT] {len(peaks)} picos de transição encontrados")
+
+        if len(peaks) == 0:
+            # Fallback: nenhuma transição clara — divide em fatias de 4min
+            print("[DETECT] Sem transições claras — usando fallback 4min")
+            fallback = []
+            t = 240.0
+            while t < total_duration - min_track_duration:
+                fallback.append(round(t, 1))
+                t += 240.0
+            return fallback
+
+        # ── 5. Para cada pico, encontra o ponto de dominância ────────────────
+        # Em uma zona de mix, a nova música começa a dominar quando
+        # o spectral centroid começa a CONVERGIR para um novo valor estável
+        # Usamos o ponto onde a derivada do centroid muda de sinal
+
+        # Beat tracking para alinhar cortes
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=HOP)
+        tempo_val  = float(np.array(tempo).flatten()[0])
+        print(f"[DETECT] BPM detectado: {round(tempo_val, 1)}")
+
+        transitions = []
+        for peak_idx in peaks:
+            t_peak = float(frame_times[peak_idx])
+
+            # Janela de busca: ±45s ao redor do pico
+            search_start = max(0, t_peak - 45)
+            search_end   = min(total_duration, t_peak + 45)
+
+            # Dentro da janela, procura o ponto onde o spectral centroid
+            # tem menor variância (sinal mais "estável" = nova música já domina)
+            f_start = max(0, peak_idx - int(45 / 0.5))
+            f_end   = min(n_frames, peak_idx + int(45 / 0.5))
+
+            if f_end - f_start < 4:
+                t_cut = t_peak
+            else:
+                # Calcula variância local do centroid em janelas de 10s
+                var_window = int(10 / 0.5)
+                local_var  = np.array([
+                    centroid_n[i:i+var_window].var()
+                    for i in range(f_start, f_end - var_window)
+                ])
+                # Ponto de mínima variância = música mais estável = corte ideal
+                min_var_idx = f_start + int(np.argmin(local_var)) + var_window // 2
+                t_cut = float(frame_times[min(min_var_idx, n_frames - 1)])
+
+            # Garante que está dentro dos limites
+            t_cut = max(min_track_duration, min(total_duration - min_track_duration, t_cut))
+
+            # Alinha ao beat mais próximo (dentro de 3s)
+            if len(beat_times) > 0:
+                diffs = np.abs(beat_times - t_cut)
+                closest_idx = int(np.argmin(diffs))
+                if diffs[closest_idx] < 3.0:
+                    # Prefere beats que são início de compasso (a cada 4 beats)
+                    bar_beats = beat_times[::4] if len(beat_times) > 4 else beat_times
+                    diffs_bar = np.abs(bar_beats - t_cut)
+                    closest_bar = int(np.argmin(diffs_bar))
+                    if diffs_bar[closest_bar] < 3.0:
+                        t_cut = float(bar_beats[closest_bar])
+                    else:
+                        t_cut = float(beat_times[closest_idx])
+
+            transitions.append(round(t_cut, 2))
+            print(f"[DETECT] Transição @ {round(t_cut/60, 2)} min (pico em {round(t_peak/60, 2)} min)")
+
+        # Remove duplicatas (cortes muito próximos = < min_track_duration)
+        transitions.sort()
+        filtered = [transitions[0]]
+        for t in transitions[1:]:
+            if t - filtered[-1] >= min_track_duration:
+                filtered.append(t)
+
+        print(f"[DETECT] {len(filtered)} transições finais: {[round(t/60, 2) for t in filtered]} min")
+        return filtered
+
+    except Exception as e:
+        print(f"[DETECT] Erro fatal: {e}")
+        import traceback; traceback.print_exc()
+        # Fallback seguro
+        try:
+            result = os.popen(
+                f'ffprobe -v error -show_entries format=duration '
+                f'-of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
+            ).read().strip()
+            duration = float(result) if result else 3600
+            fallback = []
+            t = 240.0
+            while t < duration - 90:
+                fallback.append(round(t, 1))
+                t += 240.0
+            return fallback
+        except:
+            return []
+
+
+# ─── Trim inteligente — remove zona de mix do início e fim ──────────────────
+def find_clean_start(audio_path: str, search_seconds: float = 30.0) -> float:
+    """
+    Encontra o ponto exato onde a música começa "limpa":
+    onde a energia começa a ser estável e o espectro convergiu.
+    Retorna o offset em segundos para usar no corte.
+    """
+    try:
+        import librosa
+        from scipy.ndimage import uniform_filter1d
+
+        SR  = 11025
+        HOP = int(SR * 0.25)   # 0.25s por frame — mais fino para trim
+
+        y, sr = librosa.load(audio_path, sr=SR, mono=True,
+                             duration=search_seconds, res_type="kaiser_fast")
+        if len(y) < SR * 2:
+            return 0.0
+
+        rms      = librosa.feature.rms(y=y, hop_length=HOP)[0]
+        centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP)[0]
+
+        n = min(len(rms), len(centroid))
+        rms      = rms[:n]
+        centroid = centroid[:n]
+
+        rms_smooth = uniform_filter1d(rms.astype(float), size=8)
+        rms_max    = rms_smooth.max()
+        if rms_max == 0:
+            return 0.0
+
+        # Ponto onde RMS atinge 40% do máximo e está subindo
+        threshold = rms_max * 0.40
+        for i in range(1, n - 1):
+            if rms_smooth[i] >= threshold and rms_smooth[i] > rms_smooth[i-1]:
+                t = float(librosa.frames_to_time(i, sr=sr, hop_length=HOP))
+                # Vai 0.5s antes para não cortar o ataque
+                return max(0.0, round(t - 0.5, 2))
+
+        return 0.0
+    except:
+        return 0.0
+
+def find_clean_end(audio_path: str, search_seconds: float = 30.0) -> float:
+    """
+    Encontra o ponto exato onde a música termina "limpa":
+    onde a energia começa a cair para a zona de mix do próximo.
+    Retorna a duração limpa (em segundos a partir do início do arquivo).
+    """
+    try:
+        import librosa
+        from scipy.ndimage import uniform_filter1d
+
+        SR  = 11025
+        HOP = int(SR * 0.25)
+
+        # Carrega total para descobrir duração
+        duration_result = os.popen(
+            f'ffprobe -v error -show_entries format=duration '
+            f'-of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
+        ).read().strip()
+        total_dur = float(duration_result) if duration_result else 0
+        if total_dur == 0:
+            return 0.0
+
+        # Carrega só os últimos search_seconds
+        offset = max(0, total_dur - search_seconds)
+        y, sr  = librosa.load(audio_path, sr=SR, mono=True,
+                              offset=offset, res_type="kaiser_fast")
+        if len(y) < SR * 2:
+            return total_dur
+
+        rms        = librosa.feature.rms(y=y, hop_length=HOP)[0]
+        rms_smooth = uniform_filter1d(rms.astype(float), size=8)
+        rms_max    = rms_smooth.max()
+        if rms_max == 0:
+            return total_dur
+
+        # Procura o ponto (de trás para frente) onde RMS ainda está em 40% do máximo
+        threshold = rms_max * 0.40
+        n = len(rms_smooth)
+        for i in range(n - 2, 0, -1):
+            if rms_smooth[i] >= threshold:
+                t_local = float(librosa.frames_to_time(i, sr=sr, hop_length=HOP))
+                # +0.5s para não cortar o decay
+                t_abs = offset + t_local + 0.5
+                return round(min(t_abs, total_dur), 2)
+
+        return total_dur
+    except:
+        return 0.0
+
+
+# ─── Extensão de faixa com Demucs ────────────────────────────────────────────
 def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60) -> bool:
-    """
-    Extensão de alta qualidade usando Demucs:
-    1. Separa a faixa em stems: drums, vocals, bass, other
-    2. Detecta beat grid exato via librosa
-    3. Cria intro de 16 compassos SÓ com bateria (drums stem)
-    4. Adiciona outro de 16 compassos SÓ com bateria no final
-    5. Crossfade suave nas transições
-    6. Exporta como MP3 320k
-    """
     import tempfile
     tmp_dir = tempfile.mkdtemp()
     tmp_wav = os.path.join(tmp_dir, "input.wav")
@@ -194,7 +479,6 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
         import soundfile as sf
         import subprocess
 
-        # 1. MP3 → WAV 44100Hz stereo
         ret = os.system(f'ffmpeg -i "{input_mp3}" -ar 44100 -ac 2 -y "{tmp_wav}" -loglevel quiet')
         if ret != 0 or not os.path.exists(tmp_wav):
             raise Exception("Falha na conversão MP3→WAV")
@@ -207,63 +491,42 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
         tempo, beats = librosa.beat.beat_track(y=y_mono, sr=sr)
         beat_samples = [int(x) for x in librosa.frames_to_samples(np.array(beats).flatten())]
         tempo_val = float(np.array(tempo).flatten()[0])
-        print(f"[EXTEND] BPM detectado: {round(tempo_val, 1)}")
+        print(f"[EXTEND] BPM: {round(tempo_val, 1)}")
 
         if len(beat_samples) < 8:
             seg_len = int(sr * 2)
             beat_samples = list(range(0, y_mono.shape[0], seg_len))
 
-        # 2. Separar bateria com Demucs (4stems para melhor qualidade)
         drums_audio = None
         try:
             stems_dir = os.path.join(tmp_dir, "stems")
             os.makedirs(stems_dir, exist_ok=True)
             result = subprocess.run(
-                ["python", "-m", "demucs",
-                 "-n", "htdemucs",
-                 "--four-stems",
-                 "-o", stems_dir, tmp_wav],
+                ["python", "-m", "demucs", "-n", "htdemucs", "--four-stems", "-o", stems_dir, tmp_wav],
                 capture_output=True, text=True, timeout=400
             )
-            print(f"[EXTEND] Demucs retornou: {result.returncode}")
-            # htdemucs salva em stems_dir/htdemucs/input/
             drums_path = os.path.join(stems_dir, "htdemucs", "input", "drums.wav")
             if os.path.exists(drums_path):
                 drums_audio, _ = librosa.load(drums_path, sr=44100, mono=False)
                 if drums_audio.ndim == 1:
                     drums_audio = np.stack([drums_audio, drums_audio])
-                # Garante mesmo tamanho que a faixa original
                 min_len = min(y_full.shape[1], drums_audio.shape[1])
                 y_full = y_full[:, :min_len]
                 drums_audio = drums_audio[:, :min_len]
-                print(f"[EXTEND] Demucs drums OK — {round(min_len/sr, 1)}s")
-            else:
-                print(f"[EXTEND] drums.wav não encontrado em {drums_path}")
-                # Lista o que foi gerado
-                for root, dirs, files in os.walk(stems_dir):
-                    for f in files:
-                        print(f"[EXTEND] Arquivo gerado: {os.path.join(root, f)}")
         except Exception as e:
             print(f"[EXTEND] Demucs erro: {e}")
 
-        # Fallback: se Demucs falhou, usa high-pass filter para simular bateria
         if drums_audio is None:
-            print("[EXTEND] Usando fallback — high-pass filter para simular bateria")
             from scipy.signal import butter, sosfilt
             def highpass(data, cutoff=200, fs=44100, order=4):
                 sos = butter(order, cutoff / (fs/2), btype='high', output='sos')
                 return sosfilt(sos, data)
-            drums_audio = np.stack([
-                highpass(y_full[0]),
-                highpass(y_full[1])
-            ])
+            drums_audio = np.stack([highpass(y_full[0]), highpass(y_full[1])])
 
-        # 3. Calcula duração do loop de bateria — 16 compassos alinhados no beat
         beats_per_bar = 4
         bars = 16
-        beats_needed = bars * beats_per_bar  # 64 beats ≈ 30s a 128BPM
+        beats_needed = bars * beats_per_bar
 
-        # Pega amostras alinhadas ao beat
         if len(beat_samples) > beats_needed:
             intro_len = int(beat_samples[beats_needed]) - int(beat_samples[0])
             outro_len = int(beat_samples[-1]) - int(beat_samples[-(beats_needed+1)])
@@ -274,53 +537,36 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
         intro_len = min(intro_len, int(sr * 35), drums_audio.shape[1] // 3)
         outro_len = min(outro_len, int(sr * 35), drums_audio.shape[1] // 3)
 
-        # 4. Extrai segmentos de bateria para intro e outro
-        # Intro: pega a bateria do MEIO da música (mais representativo do groove)
-        mid = drums_audio.shape[1] // 2
-        mid_start = int(beat_samples[len(beat_samples)//2]) if len(beat_samples) > beats_needed else mid
+        mid_start = int(beat_samples[len(beat_samples)//2]) if len(beat_samples) > beats_needed else drums_audio.shape[1] // 2
         mid_start = max(0, mid_start)
-        mid_end   = min(drums_audio.shape[1], mid_start + intro_len)
-        drums_loop = drums_audio[:, mid_start:mid_end]
+        drums_loop = drums_audio[:, mid_start:mid_start + max(intro_len, outro_len)]
 
-        # 5. Monta a estrutura: [bateria intro] + [música] + [bateria outro]
         fade_samples = min(int(sr * 2), intro_len // 4, outro_len // 4)
         f_in  = np.linspace(0.0, 1.0, fade_samples)
         f_out = np.linspace(1.0, 0.0, fade_samples)
 
-        # Intro de bateria (sem fade in, começa direto; fade out no final)
         intro_drum = drums_loop[:, :intro_len].copy()
         intro_drum[:, -fade_samples:] = (
-            intro_drum[:, -fade_samples:] * f_out +
-            y_full[:, :fade_samples] * f_in
+            intro_drum[:, -fade_samples:] * f_out + y_full[:, :fade_samples] * f_in
         )
 
-        # Música completa (sem fade — não mexe no meio)
-        music = y_full.copy()
-
-        # Outro de bateria (fade in no início; fade out suave no final)
         outro_drum = drums_loop[:, :outro_len].copy()
         outro_drum[:, :fade_samples] = (
-            y_full[:, -fade_samples:] * f_out +
-            outro_drum[:, :fade_samples] * f_in
+            y_full[:, -fade_samples:] * f_out + outro_drum[:, :fade_samples] * f_in
         )
-        # Fade out final suave (últimos 4s)
         final_fade = min(int(sr * 4), outro_len)
         outro_drum[:, -final_fade:] *= np.linspace(1.0, 0.0, final_fade)
 
-        # 6. Concatena: intro_drum (com transição embutida) + música + outro_drum
-        # A transição já está embutida nos fades — sem sobreposição dupla
         extended = np.concatenate([
-            intro_drum[:, :-fade_samples],   # intro sem os últimos fade_samples
-            y_full,                           # música completa
-            outro_drum[:, fade_samples:]      # outro sem os primeiros fade_samples
+            intro_drum[:, :-fade_samples],
+            y_full,
+            outro_drum[:, fade_samples:]
         ], axis=1)
 
-        # 7. Normaliza
         peak = np.max(np.abs(extended))
         if peak > 0.95:
             extended = extended * (0.95 / peak)
 
-        # 8. Exporta
         combined_path = os.path.join(tmp_dir, "combined.wav")
         sf.write(combined_path, extended.T, sr, subtype="PCM_16")
         ret2 = os.system(
@@ -328,188 +574,30 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
         )
 
         total = extended.shape[1] / sr
-        print(f"[EXTEND] OK — {round(intro_len/sr,1)}s bateria + {round(y_full.shape[1]/sr,1)}s música + {round(outro_len/sr,1)}s bateria = {round(total,1)}s total")
+        print(f"[EXTEND] OK — {round(total, 1)}s total")
         return ret2 == 0 and os.path.exists(output_mp3)
 
     except Exception as e:
         print(f"[EXTEND] Erro fatal: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return False
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-def safe_filename(name: str) -> str:
-    for ch in r'\/:*?"<>|':
-        name = name.replace(ch, "_")
-    return name.strip()
-
-
-# ─── Detecção inteligente de transições ─────────────────────────────────────
-def detect_transitions(audio_path: str, min_track_duration: float = 120.0) -> list:
-    """
-    Detecta transições com precisão combinando 3 análises:
-    1. RMS energy — detecta zona de mixagem (onde o DJ sobrepõe as músicas)
-    2. Spectral flux — detecta mudança de timbre
-    3. Beat alignment — alinha o corte exatamente no beat
-    Retorna o ponto CENTRAL de cada zona de transição, alinhado ao beat.
-    """
-    try:
-        import librosa
-        from scipy.ndimage import uniform_filter1d
-        from scipy.signal import find_peaks
-
-        print("[SPLIT] Carregando áudio (mono 11025Hz para análise leve)...")
-        # Carrega em baixa resolução — suficiente para detectar transições
-        y, sr = librosa.load(audio_path, sr=11025, mono=True, res_type="kaiser_fast")
-        duration = len(y) / sr
-        print(f"[SPLIT] Duração: {round(duration/60, 1)} min")
-
-        if duration < min_track_duration * 2:
-            return []
-
-        # hop_length grande = análise leve (1 frame ≈ 0.5s)
-        hop_length = int(sr * 0.5)
-
-        # 1. RMS — energia do sinal
-        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-
-        # 2. Spectral flux — mudança espectral entre frames
-        stft   = np.abs(librosa.stft(y, hop_length=hop_length, n_fft=512))
-        flux   = np.sum(np.maximum(0, np.diff(stft, axis=1)), axis=0)
-        min_len = min(len(rms), len(flux) + 1)
-        rms    = rms[:min_len]
-        flux_padded = np.pad(flux, (0, min_len - len(flux)))[:min_len]
-
-        # 3. Normaliza os dois sinais
-        def normalize(x):
-            x = uniform_filter1d(x, size=max(1, int(10 / 0.5)))  # suaviza 10s
-            mn, mx = x.min(), x.max()
-            return (x - mn) / (mx - mn + 1e-9)
-
-        rms_norm  = normalize(rms)
-        flux_norm = normalize(flux_padded)
-
-        # 4. Combina: transição = queda de RMS + pico de flux
-        # Zona de transição = onde o DJ está mixando (RMS baixo + flux alto)
-        transition_score = (1 - rms_norm) * 0.5 + flux_norm * 0.5
-
-        # 5. Detecta zonas de transição (regiões acima do threshold)
-        min_frames = int(min_track_duration / 0.5)
-        peaks, props = find_peaks(
-            transition_score,
-            height=0.4,
-            distance=min_frames,
-            prominence=0.15,
-            width=int(5 / 0.5)  # transição mínima de 5s
-        )
-
-        frame_times = librosa.frames_to_time(
-            np.arange(len(transition_score)), sr=sr, hop_length=hop_length
-        )
-
-        # 6. Para cada pico, encontra o centro da zona de transição
-        # e alinha ao beat mais próximo
-        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
-        tempo_val  = float(np.array(tempo).flatten()[0])
-        print(f"[SPLIT] BPM: {round(tempo_val, 1)}")
-
-        transitions = []
-        for p in peaks:
-            t = float(frame_times[p])
-
-            # Encontra o beat mais próximo do pico
-            if len(beat_times) > 0:
-                closest_beat = beat_times[np.argmin(np.abs(beat_times - t))]
-                # Só usa o beat se estiver a menos de 2s do pico
-                if abs(closest_beat - t) < 2.0:
-                    t = float(closest_beat)
-
-            if t > min_track_duration and t < duration - min_track_duration:
-                transitions.append(round(t, 2))
-
-        # Fallback se não detectou nada
-        if not transitions:
-            print("[SPLIT] Sem transições — usando 3.5 min por faixa")
-            t = 210.0
-            while t < duration - min_track_duration:
-                transitions.append(round(t, 1))
-                t += 210.0
-
-        print(f"[SPLIT] {len(transitions)} transições detectadas: {[round(t,1) for t in transitions]}")
-        return transitions
-
-    except Exception as e:
-        print(f"[SPLIT] Erro: {e}")
-        import traceback; traceback.print_exc()
-        # Fallback seguro
-        try:
-            result = os.popen(
-                f'ffprobe -v error -show_entries format=duration '
-                f'-of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
-            ).read().strip()
-            duration = float(result) if result else 3600
-            transitions = []
-            t = 210.0
-            while t < duration - min_track_duration:
-                transitions.append(round(t, 1))
-                t += 210.0
-            return transitions
-        except:
-            return []
-def split_by_transitions(input_path: str, folder: str, transitions: list) -> list:
-    """
-    Divide o áudio nos pontos de transição detectados.
-    Retorna lista de caminhos dos arquivos gerados.
-    """
-    import subprocess
-
-    # Obtém duração total
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-        capture_output=True, text=True
-    )
-    total_duration = float(result.stdout.strip()) if result.stdout.strip() else 0
-
-    # Monta lista de segmentos: (start, end)
-    boundaries = [0.0] + transitions + [total_duration]
-    segments = [(boundaries[i], boundaries[i+1]) for i in range(len(boundaries)-1)]
-
-    print(f"[SPLIT] Dividindo em {len(segments)} segmentos")
-
-    track_paths = []
-    for i, (start, end) in enumerate(segments):
-        duration = end - start
-        if duration < 30:  # ignora segmentos muito curtos
-            print(f"[SPLIT] Segmento {i} muito curto ({round(duration,1)}s), ignorando")
-            continue
-
-        out_path = os.path.join(folder, f"track_{i:03d}.mp3")
-        ret = os.system(
-            f'ffmpeg -ss {start} -t {duration} -i "{input_path}" '
-            f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{out_path}" -loglevel quiet'
-        )
-        if ret == 0 and os.path.exists(out_path):
-            track_paths.append(out_path)
-            print(f"[SPLIT] Faixa {i+1}: {round(start/60,1)}min → {round(end/60,1)}min ({round(duration/60,1)}min)")
-
-    return track_paths
 
 
 # ─── Processamento em background ─────────────────────────────────────────────
 def process_job(job_id: str, input_path: str, folder: str):
     """
-    Divide o set usando identificação inteligente:
-    1. Divide em segmentos de 30s
-    2. Identifica cada segmento com ACRCloud + AudD
-    3. Agrupa segmentos consecutivos da mesma música
-    4. Corta nos pontos de mudança de música
-    5. Salva no R2
+    Pipeline completo:
+    1. Análise espectral → detecta transições (SEM APIs externas)
+    2. Corta as faixas nos pontos de dominância
+    3. Trim fino em cada faixa (remove zona de mix do início e fim)
+    4. Identifica cada faixa com ACRCloud + AudD (só para nomear)
+    5. Exporta MP3 320k + upload R2
     """
     try:
-        job_set(job_id, {"status": "processing", "tracks": [], "progress": 0,
-                         "stage": "Iniciando análise..."})
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 2,
+                         "stage": "Iniciando análise espectral..."})
 
         # Duração total
         result = os.popen(
@@ -522,139 +610,93 @@ def process_job(job_id: str, input_path: str, folder: str):
 
         print(f"[JOB] Duração total: {round(total_duration/60, 1)} min")
 
-        # 1. Divide em segmentos de 30s para identificação
-        segment_duration = 30
-        segments_folder = folder + "/segments"
-        os.makedirs(segments_folder, exist_ok=True)
-
+        # ── ETAPA 1: Detecção de transições por espectro ─────────────────────
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
-                         "stage": "Dividindo em segmentos para análise..."})
+                         "stage": "Analisando espectro do set (pode levar 1-2 min)..."})
 
-        os.system(
-            f'ffmpeg -i "{input_path}" -f segment -segment_time {segment_duration} '
-            f'-vn -acodec mp3 -ab 192k -ar 44100 -y "{segments_folder}/seg_%04d.mp3" -loglevel quiet'
-        )
+        transitions = detect_transitions_spectral(input_path, min_track_duration=90.0)
 
-        segment_files = sorted(
-            f for f in os.listdir(segments_folder) if f.startswith("seg_") and f.endswith(".mp3")
-        )
-        total_segs = len(segment_files)
-        print(f"[JOB] {total_segs} segmentos de 30s para analisar")
+        n_tracks_expected = len(transitions) + 1
+        print(f"[JOB] {len(transitions)} transições → {n_tracks_expected} faixas esperadas")
 
-        # 2. Identifica cada segmento
-        seg_identities = []
-        for i, seg_file in enumerate(segment_files):
-            seg_path = os.path.join(segments_folder, seg_file)
-            ts = i * segment_duration
-            progress = 5 + int((i / total_segs) * 60)
-            job_set(job_id, {"status": "processing", "tracks": [], "progress": progress,
-                             "stage": f"Identificando segmento {i+1} de {total_segs}..."})
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 30,
+                         "stage": f"Transições detectadas: {len(transitions)}. Cortando faixas..."})
 
-            info = identify_song(seg_path, ts)
-            seg_identities.append({
-                "index": i,
-                "start": ts,
-                "end": min(ts + segment_duration, total_duration),
-                "artist": info["artist"],
-                "title": info["title"],
-                "known": info["artist"] != "Desconhecido"
-            })
-            print(f"[JOB] Seg {i+1}/{total_segs} @ {round(ts/60,1)}min: {info['artist']} - {info['title']}")
-
-        # 3. Agrupa segmentos consecutivos da mesma música
-        job_set(job_id, {"status": "processing", "tracks": [], "progress": 70,
-                         "stage": "Agrupando faixas identificadas..."})
-
-        def same_track(a, b):
-            """Verifica se dois segmentos são da mesma música."""
-            # Se ambos são desconhecidos, considera mesma faixa (zona de transição)
-            if a["artist"] == "Desconhecido" and b["artist"] == "Desconhecido":
-                return True
-            # Se um é desconhecido, pode ser zona de mixagem — mantém no grupo atual
-            if a["artist"] == "Desconhecido" or b["artist"] == "Desconhecido":
-                return True  # tolerante: desconhecido = provavelmente mesma faixa
-            return (a["artist"].lower() == b["artist"].lower() and
-                    a["title"].lower() == b["title"].lower())
-
-        # Monta grupos com lógica tolerante
-        # Um grupo só muda quando encontra 2 segmentos CONHECIDOS E DIFERENTES consecutivos
-        groups = []
-        current_group = [seg_identities[0]]
-
-        for i, seg in enumerate(seg_identities[1:], 1):
-            prev = current_group[-1]
-            
-            # Mudança de música = ambos conhecidos E diferentes
-            both_known = seg["known"] and prev["known"]
-            different   = not same_track(seg, prev) if both_known else False
-            
-            # Confirma mudança: precisa de 2 segmentos diferentes consecutivos
-            # para evitar falsos positivos
-            if different and i + 1 < len(seg_identities):
-                next_seg = seg_identities[i + 1] if i + 1 < len(seg_identities) else seg
-                confirmed = (next_seg["known"] and 
-                             next_seg["artist"].lower() == seg["artist"].lower())
-                if confirmed:
-                    groups.append(current_group)
-                    current_group = [seg]
-                    continue
-            
-            current_group.append(seg)
-        
-        groups.append(current_group)
-
-        print(f"[JOB] {len(groups)} grupos de músicas detectados")
-
-        # 4. Para cada grupo, determina o nome mais comum e os limites
-        # Margem de 5s: remove a zona de mixagem do início e fim de cada faixa
-        MARGIN = 5.0
+        # ── ETAPA 2: Define segmentos ────────────────────────────────────────
+        boundaries = [0.0] + transitions + [total_duration]
+        segments   = [(boundaries[i], boundaries[i+1]) for i in range(len(boundaries)-1)]
 
         tracks = []
-        for i, group in enumerate(groups):
-            start_time = group[0]["start"]
-            end_time   = group[-1]["end"]
-            duration   = end_time - start_time
+        for i, (raw_start, raw_end) in enumerate(segments):
+            raw_duration = raw_end - raw_start
 
-            # Ignora segmentos muito curtos (< 60s = provavelmente zona de mixagem)
-            if duration < 60:
-                print(f"[JOB] Grupo {i} muito curto ({round(duration)}s), ignorando")
+            if raw_duration < 60:
+                print(f"[JOB] Segmento {i} muito curto ({round(raw_duration)}s), ignorando")
                 continue
 
-            # Nome mais frequente no grupo (ignora desconhecidos)
-            known = [s for s in group if s["known"]]
-            if known:
-                # Pega o nome do segmento do meio do grupo (mais limpo)
-                mid_seg = known[len(known)//2]
-                artist = mid_seg["artist"]
-                title  = mid_seg["title"]
-            else:
-                artist = "Desconhecido"
-                title  = f"Faixa {round(start_time)}s"
+            progress = 30 + int((i / len(segments)) * 40)
+            job_set(job_id, {"status": "processing", "tracks": tracks, "progress": progress,
+                             "stage": f"Processando faixa {i+1} de {len(segments)}..."})
 
-            display_name = artist + " - " + title
-            fname        = f"track_{i:03d}.mp3"
-            track_path   = os.path.join(folder, fname)
-
-            # Aplica margem para remover zona de mixagem
-            cut_start = max(0, start_time + MARGIN) if i > 0 else start_time
-            cut_end   = min(total_duration, end_time - MARGIN) if i < len(groups)-1 else end_time
-            cut_dur   = cut_end - cut_start
-
-            if cut_dur < 30:
-                print(f"[JOB] Faixa {i} muito curta após margem ({round(cut_dur)}s), ignorando")
-                continue
-
-            # Exporta o segmento
+            # ── ETAPA 3: Extrai segmento bruto ───────────────────────────────
+            raw_path = os.path.join(folder, f"raw_{i:03d}.mp3")
             ret = os.system(
-                f'ffmpeg -ss {cut_start} -t {cut_dur} -i "{input_path}" '
+                f'ffmpeg -ss {raw_start} -t {raw_duration} -i "{input_path}" '
+                f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{raw_path}" -loglevel quiet'
+            )
+            if ret != 0 or not os.path.exists(raw_path):
+                print(f"[JOB] Erro ao extrair segmento {i}")
+                continue
+
+            # ── ETAPA 4: Trim inteligente ─────────────────────────────────────
+            # Para a primeira faixa, não trimamos o início
+            # Para a última faixa, não trimamos o final
+            trim_start_offset = 0.0
+            trim_end_duration = raw_duration
+
+            if i > 0:
+                # Remove zona de mix do início (busca nos primeiros 30s)
+                trim_start_offset = find_clean_start(raw_path, search_seconds=30.0)
+                print(f"[JOB] Faixa {i}: trim início = +{trim_start_offset}s")
+
+            if i < len(segments) - 1:
+                # Remove zona de mix do final (busca nos últimos 30s)
+                trim_end_duration = find_clean_end(raw_path, search_seconds=30.0)
+                print(f"[JOB] Faixa {i}: trim fim = {trim_end_duration}s (de {round(raw_duration, 1)}s)")
+
+            clean_duration = trim_end_duration - trim_start_offset
+
+            if clean_duration < 45:
+                print(f"[JOB] Faixa {i} muito curta após trim ({round(clean_duration)}s), ignorando")
+                os.remove(raw_path)
+                continue
+
+            # ── ETAPA 5: Exporta versão limpa ────────────────────────────────
+            fname      = f"track_{i:03d}.mp3"
+            track_path = os.path.join(folder, fname)
+
+            ret2 = os.system(
+                f'ffmpeg -ss {trim_start_offset} -t {clean_duration} -i "{raw_path}" '
                 f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{track_path}" -loglevel quiet'
             )
+            os.remove(raw_path)   # limpa arquivo bruto
 
-            if ret != 0 or not os.path.exists(track_path):
-                print(f"[JOB] Erro ao exportar faixa {i}")
+            if ret2 != 0 or not os.path.exists(track_path):
+                print(f"[JOB] Erro ao exportar faixa limpa {i}")
                 continue
 
-            # Upload para R2
+            # Timestamp real (com trim aplicado)
+            real_start = raw_start + trim_start_offset
+
+            # ── ETAPA 6: Identifica a música (para nomear) ───────────────────
+            info = identify_song(track_path, real_start)
+            artist = info["artist"]
+            title  = info["title"]
+            display_name = f"{artist} - {title}"
+
+            print(f"[JOB] Faixa {i+1}: {round(real_start/60, 1)}min | {round(clean_duration/60, 1)}min | {display_name}")
+
+            # ── ETAPA 7: Upload R2 ────────────────────────────────────────────
             r2_key = f"{job_id}/{fname}"
             upload_to_r2(track_path, r2_key)
 
@@ -663,23 +705,24 @@ def process_job(job_id: str, input_path: str, folder: str):
                 "name":         display_name,
                 "artist":       artist,
                 "title":        title,
-                "timestamp":    int(cut_start),
-                "duration":     round(cut_dur, 1),
+                "timestamp":    int(real_start),
+                "duration":     round(clean_duration, 1),
                 "url":          f"/download/{job_id}/{fname}",
                 "url_mp3":      f"/download/{job_id}/{fname}?format=mp3",
                 "url_wav":      f"/download/{job_id}/{fname}?format=wav",
                 "url_extended": f"/download/{job_id}/{fname}?format=extended",
             })
 
-            progress = 70 + int((i / len(groups)) * 25)
             job_set(job_id, {"status": "processing", "tracks": tracks, "progress": progress,
-                             "stage": f"Processando faixa {i+1} de {len(groups)}..."})
+                             "stage": f"Faixa {len(tracks)} identificada: {display_name}"})
 
-        # Limpa segmentos temporários
-        shutil.rmtree(segments_folder, ignore_errors=True)
-
-        job_set(job_id, {"status": "done", "tracks": tracks, "progress": 100,
-                         "stage": f"Concluído — {len(tracks)} faixas identificadas!"})
+        # Resultado final
+        job_set(job_id, {
+            "status":   "done",
+            "tracks":   tracks,
+            "progress": 100,
+            "stage":    f"Concluído — {len(tracks)} faixas extraídas!"
+        })
         print(f"[JOB] {job_id} concluído — {len(tracks)} faixas")
 
     except Exception as e:
@@ -707,27 +750,19 @@ async def upload_chunk(
     total_chunks: int = Form(...),
     filename: str = Form(...)
 ):
-    """
-    Recebe chunks de arquivo e quando todos chegarem, inicia o processamento.
-    Suporta internet lenta — cada chunk de 5MB tem 2 minutos de timeout.
-    """
-    # Pasta para os chunks deste upload
     chunks_folder = f"uploads/{upload_id}"
     os.makedirs(chunks_folder, exist_ok=True)
 
-    # Salva o chunk
     chunk_path = f"{chunks_folder}/chunk_{chunk_index:04d}"
     with open(chunk_path, "wb") as f:
         shutil.copyfileobj(chunk.file, f)
 
     print(f"[CHUNK] {upload_id} — chunk {chunk_index+1}/{total_chunks} recebido")
 
-    # Verifica se todos os chunks chegaram
     received = len([f for f in os.listdir(chunks_folder) if f.startswith("chunk_")])
     if received < total_chunks:
         return {"status": "uploading", "received": received, "total": total_chunks}
 
-    # Todos os chunks chegaram — junta o arquivo
     job_id = str(uuid.uuid4())
     folder = f"outputs/{job_id}"
     os.makedirs(folder, exist_ok=True)
@@ -741,12 +776,10 @@ async def upload_chunk(
             with open(chunk_file, "rb") as cf:
                 shutil.copyfileobj(cf, out)
 
-    # Limpa chunks
     shutil.rmtree(chunks_folder, ignore_errors=True)
 
-    # Inicia processamento em background
     job_set(job_id, {"status": "processing", "tracks": [], "progress": 0,
-                     "stage": "Arquivo recebido, iniciando análise..."})
+                     "stage": "Arquivo recebido, iniciando análise espectral..."})
     background_tasks.add_task(process_job, job_id, input_path, folder)
 
     print(f"[CHUNK] Upload completo — job {job_id} iniciado")
@@ -755,7 +788,6 @@ async def upload_chunk(
 
 @app.post("/split")
 async def split_audio(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Recebe o arquivo e inicia o processamento em background imediatamente."""
     job_id = str(uuid.uuid4())
     folder = "outputs/" + job_id
     os.makedirs(folder, exist_ok=True)
@@ -764,7 +796,6 @@ async def split_audio(background_tasks: BackgroundTasks, file: UploadFile = File
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Inicia processamento em background
     job_set(job_id, {"status": "processing", "tracks": [], "progress": 0})
     background_tasks.add_task(process_job, job_id, input_path, folder)
 
@@ -791,7 +822,6 @@ async def download_track(job_id: str, filename: str, format: str = "stream"):
             return Response(content='{"error":"Arquivo nao encontrado"}',
                             status_code=404, media_type="application/json")
 
-    # Nome amigável
     display_name = base_filename.replace(".mp3", "")
     data = job_get(job_id)
     if data:
@@ -800,7 +830,7 @@ async def download_track(job_id: str, filename: str, format: str = "stream"):
                 display_name = safe_filename(t["name"])
                 break
 
-    # ── Versão estendida ──────────────────────────────────────────────────────
+    # ── Extended ──────────────────────────────────────────────────────────────
     if format == "extended":
         ext_path  = mp3_path.replace(".mp3", "_extended.mp3")
         ext_r2key = r2_key.replace(".mp3", "_extended.mp3")
