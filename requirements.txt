@@ -8,4 +8,4 @@ soundfile
 scipy
 boto3
 redis
-spleeter
+demucs
