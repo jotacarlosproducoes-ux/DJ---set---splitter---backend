@@ -613,10 +613,22 @@ async def split_audio(background_tasks: BackgroundTasks, file: UploadFile = File
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    data = job_get(job_id)
-    if not data:
-        return {"error": "Job nao encontrado"}
-    return data
+    # Tenta Redis primeiro
+    r = get_redis()
+    if r:
+        import json
+        val = r.get(f"job:{job_id}")
+        if val:
+            return json.loads(val)
+        # Chave não encontrada no Redis — verifica fallback local
+        print(f"[STATUS] job:{job_id} não encontrado no Redis")
+        print(f"[STATUS] Keys no Redis: {r.keys('job:*')[:5]}")
+    
+    # Fallback local
+    if job_id in jobs:
+        return jobs[job_id]
+    
+    return {"error": "Job nao encontrado", "redis": bool(r), "local_jobs": len(jobs)}
 
 
 @app.get("/download/{job_id}/{filename}")
