@@ -10,3 +10,5 @@ boto3
 torch
 torchaudio
 demucs
+resampy
+soxr
