@@ -361,62 +361,88 @@ def detect_transitions_spectral(audio_path: str, min_track_duration: float = 60.
 
 
 # ─── Trim inteligente — remove zona de mix do início e fim ──────────────────
-def find_clean_start(audio_path: str, search_seconds: float = 30.0) -> float:
+def _bass_energy(y: np.ndarray, sr: int, hop: int) -> np.ndarray:
     """
-    Encontra o ponto exato onde a música começa "limpa":
-    onde a energia começa a ser estável e o espectro convergiu.
-    Retorna o offset em segundos para usar no corte.
+    Extrai energia do sub-bass (60-150Hz) frame a frame.
+    Em House/Techno/Trance o bassline define qual música está dominando.
+    """
+    import librosa
+    from scipy.ndimage import uniform_filter1d
+    n_fft = 2048
+    stft  = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    bass_bins = np.where((freqs >= 60) & (freqs <= 150))[0]
+    bass_energy = stft[bass_bins, :].mean(axis=0)
+    return uniform_filter1d(bass_energy.astype(float), size=8)
+
+
+def find_clean_start(audio_path: str, search_seconds: float = 90.0) -> float:
+    """
+    Para House/Techno/Trance: encontra onde o BASS da nova música domina.
+    O corte ideal é quando o bassline novo se estabiliza e a música anterior
+    some do sub-bass. Busca nos primeiros search_seconds do segmento.
     """
     try:
         import librosa
         from scipy.ndimage import uniform_filter1d
 
-        SR  = 11025
-        HOP = int(SR * 0.25)   # 0.25s por frame — mais fino para trim
+        SR  = 22050   # precisa de resolução maior para analisar bass
+        HOP = int(SR * 0.25)
 
         y, sr = librosa.load(audio_path, sr=SR, mono=True,
                              duration=search_seconds, res_type="kaiser_fast")
-        if len(y) < SR * 2:
+        if len(y) < SR * 3:
             return 0.0
 
-        rms      = librosa.feature.rms(y=y, hop_length=HOP)[0]
-        centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP)[0]
-
-        n = min(len(rms), len(centroid))
-        rms      = rms[:n]
-        centroid = centroid[:n]
-
-        rms_smooth = uniform_filter1d(rms.astype(float), size=8)
-        rms_max    = rms_smooth.max()
-        if rms_max == 0:
+        bass   = _bass_energy(y, sr, HOP)
+        n      = len(bass)
+        b_max  = bass.max()
+        if b_max == 0:
             return 0.0
 
-        # Ponto onde RMS atinge 40% do máximo e está subindo
-        threshold = rms_max * 0.40
-        for i in range(1, n - 1):
-            if rms_smooth[i] >= threshold and rms_smooth[i] > rms_smooth[i-1]:
+        bass_norm = bass / b_max
+
+        # Também analisa o RMS geral
+        rms       = librosa.feature.rms(y=y, hop_length=HOP)[0]
+        rms_n     = rms[:n].astype(float)
+        rms_max   = rms_n.max()
+        if rms_max > 0:
+            rms_n = rms_n / rms_max
+
+        # Ponto onde bass atinge 50% do máximo E está subindo de forma consistente
+        # (média dos próximos 2s também está subindo = tendência real, não pico)
+        window = int(2.0 / 0.25)  # 2s em frames
+        for i in range(window, n - window):
+            bass_here = bass_norm[i]
+            bass_next = bass_norm[i:i+window].mean()
+            bass_prev = bass_norm[max(0,i-window):i].mean()
+
+            if bass_here >= 0.50 and bass_next > bass_prev and rms_n[i] >= 0.40:
                 t = float(librosa.frames_to_time(i, sr=sr, hop_length=HOP))
-                # Vai 0.5s antes para não cortar o ataque
-                return max(0.0, round(t - 0.5, 2))
+                # Recua 1 compasso (≈2s a 120bpm) para não cortar o ataque do kick
+                t = max(0.0, t - 2.0)
+                print(f"[TRIM] Início limpo encontrado em {round(t, 1)}s")
+                return round(t, 2)
 
         return 0.0
-    except:
+    except Exception as e:
+        print(f"[TRIM] find_clean_start erro: {e}")
         return 0.0
 
-def find_clean_end(audio_path: str, search_seconds: float = 30.0) -> float:
+
+def find_clean_end(audio_path: str, search_seconds: float = 90.0) -> float:
     """
-    Encontra o ponto exato onde a música termina "limpa":
-    onde a energia começa a cair para a zona de mix do próximo.
-    Retorna a duração limpa (em segundos a partir do início do arquivo).
+    Para House/Techno/Trance: encontra onde o BASS da música atual some.
+    Quando o bassline cai e só resta percussão = zona de mix = fim da música.
+    Busca nos últimos search_seconds do segmento.
     """
     try:
         import librosa
         from scipy.ndimage import uniform_filter1d
 
-        SR  = 11025
+        SR  = 22050
         HOP = int(SR * 0.25)
 
-        # Carrega total para descobrir duração
         duration_result = os.popen(
             f'ffprobe -v error -show_entries format=duration '
             f'-of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
@@ -425,32 +451,52 @@ def find_clean_end(audio_path: str, search_seconds: float = 30.0) -> float:
         if total_dur == 0:
             return 0.0
 
-        # Carrega só os últimos search_seconds
         offset = max(0, total_dur - search_seconds)
         y, sr  = librosa.load(audio_path, sr=SR, mono=True,
                               offset=offset, res_type="kaiser_fast")
-        if len(y) < SR * 2:
+        if len(y) < SR * 3:
             return total_dur
 
-        rms        = librosa.feature.rms(y=y, hop_length=HOP)[0]
-        rms_smooth = uniform_filter1d(rms.astype(float), size=8)
-        rms_max    = rms_smooth.max()
-        if rms_max == 0:
+        bass      = _bass_energy(y, sr, HOP)
+        n         = len(bass)
+        b_max     = bass.max()
+        if b_max == 0:
             return total_dur
 
-        # Procura o ponto (de trás para frente) onde RMS ainda está em 40% do máximo
-        threshold = rms_max * 0.40
-        n = len(rms_smooth)
-        for i in range(n - 2, 0, -1):
-            if rms_smooth[i] >= threshold:
+        bass_norm = bass / b_max
+
+        rms     = librosa.feature.rms(y=y, hop_length=HOP)[0]
+        rms_n   = rms[:n].astype(float)
+        rms_max = rms_n.max()
+        if rms_max > 0:
+            rms_n = rms_n / rms_max
+
+        window = int(2.0 / 0.25)
+
+        # Varre de trás para frente: procura onde o bass ainda está forte
+        # Depois avança para frente até o bass cair abaixo de 35%
+        # = ponto onde a música atual perdeu o bassline
+        last_strong = n - 1
+        for i in range(n - window - 1, window, -1):
+            if bass_norm[i] >= 0.50:
+                last_strong = i
+                break
+
+        # A partir de last_strong, encontra onde bass cai definitivamente
+        for i in range(last_strong, n - window):
+            bass_ahead = bass_norm[i:i+window].mean()
+            if bass_ahead < 0.35:
                 t_local = float(librosa.frames_to_time(i, sr=sr, hop_length=HOP))
-                # +0.5s para não cortar o decay
-                t_abs = offset + t_local + 0.5
-                return round(min(t_abs, total_dur), 2)
+                t_abs   = offset + t_local
+                # Adiciona 1 compasso para pegar o decay natural
+                t_abs   = min(t_abs + 2.0, total_dur)
+                print(f"[TRIM] Fim limpo encontrado em {round(t_abs, 1)}s (de {round(total_dur, 1)}s)")
+                return round(t_abs, 2)
 
         return total_dur
-    except:
-        return 0.0
+    except Exception as e:
+        print(f"[TRIM] find_clean_end erro: {e}")
+        return total_dur
 
 
 # ─── Extensão de faixa com Demucs ────────────────────────────────────────────
@@ -640,7 +686,7 @@ def process_job(job_id: str, input_path: str, folder: str):
             trim_end_duration = raw_duration
 
             if i > 0:
-                detected_start = find_clean_start(raw_path, search_seconds=30.0)
+                detected_start = find_clean_start(raw_path, search_seconds=90.0)
                 if 1.0 <= detected_start <= 20.0:
                     trim_start_offset = detected_start
                     print(f"[JOB] Faixa {i}: trim início = +{trim_start_offset}s")
@@ -648,7 +694,7 @@ def process_job(job_id: str, input_path: str, folder: str):
                     print(f"[JOB] Faixa {i}: trim início ignorado ({detected_start}s), usando 0s")
 
             if i < len(segments) - 1:
-                detected_end = find_clean_end(raw_path, search_seconds=30.0)
+                detected_end = find_clean_end(raw_path, search_seconds=90.0)
                 if detected_end > raw_duration * 0.5 and detected_end > 30.0:
                     trim_end_duration = detected_end
                     print(f"[JOB] Faixa {i}: trim fim = {trim_end_duration}s (de {round(raw_duration, 1)}s)")
