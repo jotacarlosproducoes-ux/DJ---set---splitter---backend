@@ -201,24 +201,29 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
         if ret != 0 or not os.path.exists(tmp_wav):
             raise Exception("Falha na conversão MP3→WAV")
 
-        # 2. Separação de stems com Spleeter
+        # 2. Separação de stems com Demucs (Meta AI)
         try:
-            from spleeter.separator import Separator
-            separator = Separator("spleeter:4stems")
+            import subprocess
             stems_dir = os.path.join(tmp_dir, "stems")
             os.makedirs(stems_dir, exist_ok=True)
-            separator.separate_to_file(tmp_wav, stems_dir)
-            stem_base = os.path.join(stems_dir, "input")
+            result = subprocess.run(
+                ["python", "-m", "demucs", "--two-stems=vocals",
+                 "-n", "htdemucs", "-o", stems_dir, tmp_wav],
+                capture_output=True, text=True, timeout=300
+            )
+            print(f"[EXTEND] Demucs stdout: {result.stdout[-500:]}")
+            print(f"[EXTEND] Demucs stderr: {result.stderr[-500:]}")
+
+            # Demucs salva em stems_dir/htdemucs/input/
+            stem_base = os.path.join(stems_dir, "htdemucs", "input")
             stem_files = {
                 "vocals": os.path.join(stem_base, "vocals.wav"),
-                "drums":  os.path.join(stem_base, "drums.wav"),
-                "bass":   os.path.join(stem_base, "bass.wav"),
-                "other":  os.path.join(stem_base, "other.wav"),
+                "other":  os.path.join(stem_base, "no_vocals.wav"),
             }
             use_spleeter = all(os.path.exists(f) for f in stem_files.values())
-            print("[EXTEND] Spleeter: " + ("OK" if use_spleeter else "FALHOU, usando fallback"))
+            print("[EXTEND] Demucs: " + ("OK" if use_spleeter else "FALHOU, usando fallback"))
         except Exception as e:
-            print(f"[EXTEND] Spleeter erro: {e} — usando fallback")
+            print(f"[EXTEND] Demucs erro: {e} — usando fallback")
             use_spleeter = False
 
         if use_spleeter:
