@@ -344,104 +344,119 @@ def safe_filename(name: str) -> str:
     return name.strip()
 
 
-# ─── Detecção inteligente de transições (leve e rápida) ─────────────────────
+# ─── Detecção inteligente de transições ─────────────────────────────────────
 def detect_transitions(audio_path: str, min_track_duration: float = 120.0) -> list:
     """
-    Detecta transições usando RMS energy — leve, rápido, sem travar o servidor.
-    Analisa o volume a cada 1 segundo e detecta quedas (mixagem do DJ).
+    Detecta transições com precisão combinando 3 análises:
+    1. RMS energy — detecta zona de mixagem (onde o DJ sobrepõe as músicas)
+    2. Spectral flux — detecta mudança de timbre
+    3. Beat alignment — alinha o corte exatamente no beat
+    Retorna o ponto CENTRAL de cada zona de transição, alinhado ao beat.
     """
     try:
-        print("[SPLIT] Detectando transições por energia RMS...")
+        import librosa
+        from scipy.ndimage import uniform_filter1d
+        from scipy.signal import find_peaks
 
-        # Usa ffprobe para pegar duração
-        result = os.popen(
-            f'ffprobe -v error -show_entries format=duration '
-            f'-of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
-        ).read().strip()
-        duration = float(result) if result else 0
+        print("[SPLIT] Carregando áudio (mono 11025Hz para análise leve)...")
+        # Carrega em baixa resolução — suficiente para detectar transições
+        y, sr = librosa.load(audio_path, sr=11025, mono=True, res_type="kaiser_fast")
+        duration = len(y) / sr
+        print(f"[SPLIT] Duração: {round(duration/60, 1)} min")
+
         if duration < min_track_duration * 2:
             return []
 
-        print(f"[SPLIT] Duração: {round(duration/60, 1)} min")
+        # hop_length grande = análise leve (1 frame ≈ 0.5s)
+        hop_length = int(sr * 0.5)
 
-        # Extrai RMS a cada 1 segundo via ffmpeg (muito mais leve que librosa)
-        tmp_rms = audio_path + "_rms.txt"
-        os.system(
-            f'ffmpeg -i "{audio_path}" -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file={tmp_rms}" '
-            f'-f null - -loglevel quiet 2>/dev/null'
+        # 1. RMS — energia do sinal
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+
+        # 2. Spectral flux — mudança espectral entre frames
+        stft   = np.abs(librosa.stft(y, hop_length=hop_length, n_fft=512))
+        flux   = np.sum(np.maximum(0, np.diff(stft, axis=1)), axis=0)
+        min_len = min(len(rms), len(flux) + 1)
+        rms    = rms[:min_len]
+        flux_padded = np.pad(flux, (0, min_len - len(flux)))[:min_len]
+
+        # 3. Normaliza os dois sinais
+        def normalize(x):
+            x = uniform_filter1d(x, size=max(1, int(10 / 0.5)))  # suaviza 10s
+            mn, mx = x.min(), x.max()
+            return (x - mn) / (mx - mn + 1e-9)
+
+        rms_norm  = normalize(rms)
+        flux_norm = normalize(flux_padded)
+
+        # 4. Combina: transição = queda de RMS + pico de flux
+        # Zona de transição = onde o DJ está mixando (RMS baixo + flux alto)
+        transition_score = (1 - rms_norm) * 0.5 + flux_norm * 0.5
+
+        # 5. Detecta zonas de transição (regiões acima do threshold)
+        min_frames = int(min_track_duration / 0.5)
+        peaks, props = find_peaks(
+            transition_score,
+            height=0.4,
+            distance=min_frames,
+            prominence=0.15,
+            width=int(5 / 0.5)  # transição mínima de 5s
         )
 
-        # Lê os valores RMS
-        rms_values = []
-        timestamps = []
-        if os.path.exists(tmp_rms):
-            with open(tmp_rms) as f:
-                for line in f:
-                    if "RMS_level" in line:
-                        try:
-                            val = float(line.strip().split("=")[1])
-                            if val > -100:  # ignora silêncio absoluto
-                                rms_values.append(val)
-                        except:
-                            pass
-            os.remove(tmp_rms)
+        frame_times = librosa.frames_to_time(
+            np.arange(len(transition_score)), sr=sr, hop_length=hop_length
+        )
 
-        if len(rms_values) < 10:
-            # Fallback: usa detecção simples por BPM estimado
-            print("[SPLIT] RMS insuficiente, usando divisão por tempo estimado")
-            # Estima ~3.5 min por faixa de techno/house
-            segment_time = 210  # 3.5 minutos
-            transitions = []
-            t = segment_time
-            while t < duration - min_track_duration:
-                transitions.append(t)
-                t += segment_time
-            return transitions
-
-        # Converte RMS para array numpy
-        rms = np.array(rms_values)
-        # Cada valor = ~1 frame de ffmpeg (aprox 1s)
-        frame_duration = duration / len(rms)
-
-        # Suaviza com janela de 10s
-        from scipy.ndimage import uniform_filter1d
-        rms_smooth = uniform_filter1d(rms, size=max(1, int(10 / frame_duration)))
-
-        # Detecta quedas bruscas de volume (= mixagem do DJ entrando)
-        # Diferença entre frames consecutivos
-        rms_diff = np.abs(np.diff(rms_smooth))
-
-        # Normaliza
-        if rms_diff.max() > 0:
-            rms_diff = rms_diff / rms_diff.max()
-
-        from scipy.signal import find_peaks
-        min_frames = int(min_track_duration / frame_duration)
-        peaks, _ = find_peaks(rms_diff, height=0.25, distance=min_frames, prominence=0.1)
+        # 6. Para cada pico, encontra o centro da zona de transição
+        # e alinha ao beat mais próximo
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
+        tempo_val  = float(np.array(tempo).flatten()[0])
+        print(f"[SPLIT] BPM: {round(tempo_val, 1)}")
 
         transitions = []
         for p in peaks:
-            t = p * frame_duration
-            if t > min_track_duration and t < duration - min_track_duration:
-                transitions.append(round(t, 1))
+            t = float(frame_times[p])
 
-        # Se não encontrou nada, divide em segmentos de 3.5 min
+            # Encontra o beat mais próximo do pico
+            if len(beat_times) > 0:
+                closest_beat = beat_times[np.argmin(np.abs(beat_times - t))]
+                # Só usa o beat se estiver a menos de 2s do pico
+                if abs(closest_beat - t) < 2.0:
+                    t = float(closest_beat)
+
+            if t > min_track_duration and t < duration - min_track_duration:
+                transitions.append(round(t, 2))
+
+        # Fallback se não detectou nada
         if not transitions:
-            print("[SPLIT] Sem transições detectadas, usando 3.5 min por faixa")
+            print("[SPLIT] Sem transições — usando 3.5 min por faixa")
             t = 210.0
             while t < duration - min_track_duration:
                 transitions.append(round(t, 1))
                 t += 210.0
 
-        print(f"[SPLIT] {len(transitions)} transições: {transitions}")
+        print(f"[SPLIT] {len(transitions)} transições detectadas: {[round(t,1) for t in transitions]}")
         return transitions
 
     except Exception as e:
         print(f"[SPLIT] Erro: {e}")
         import traceback; traceback.print_exc()
-        return []
-
-
+        # Fallback seguro
+        try:
+            result = os.popen(
+                f'ffprobe -v error -show_entries format=duration '
+                f'-of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
+            ).read().strip()
+            duration = float(result) if result else 3600
+            transitions = []
+            t = 210.0
+            while t < duration - min_track_duration:
+                transitions.append(round(t, 1))
+                t += 210.0
+            return transitions
+        except:
+            return []
 def split_by_transitions(input_path: str, folder: str, transitions: list) -> list:
     """
     Divide o áudio nos pontos de transição detectados.
