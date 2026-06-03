@@ -344,68 +344,101 @@ def safe_filename(name: str) -> str:
     return name.strip()
 
 
-# ─── Detecção inteligente de transições ─────────────────────────────────────
-def detect_transitions(audio_path: str, min_track_duration: float = 90.0) -> list:
+# ─── Detecção inteligente de transições (leve e rápida) ─────────────────────
+def detect_transitions(audio_path: str, min_track_duration: float = 120.0) -> list:
     """
-    Detecta os pontos exatos onde uma música termina e outra começa no set do DJ.
-    Usa análise espectral de novidade (novelty) para encontrar transições.
-    Retorna lista de timestamps em segundos.
+    Detecta transições usando RMS energy — leve, rápido, sem travar o servidor.
+    Analisa o volume a cada 1 segundo e detecta quedas (mixagem do DJ).
     """
     try:
-        import librosa
+        print("[SPLIT] Detectando transições por energia RMS...")
 
-        print("[SPLIT] Carregando áudio para análise espectral...")
-        y, sr = librosa.load(audio_path, sr=22050, mono=True)  # 22050 Hz suficiente para análise
-        duration = len(y) / sr
-        print(f"[SPLIT] Duração total: {round(duration/60, 1)} minutos")
+        # Usa ffprobe para pegar duração
+        result = os.popen(
+            f'ffprobe -v error -show_entries format=duration '
+            f'-of default=noprint_wrappers=1:nokey=1 "{audio_path}"'
+        ).read().strip()
+        duration = float(result) if result else 0
+        if duration < min_track_duration * 2:
+            return []
 
-        # 1. Calcula chroma e MFCC para detectar mudanças harmônicas
-        hop_length = 512
-        chroma     = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
-        mfcc       = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
-        rms        = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+        print(f"[SPLIT] Duração: {round(duration/60, 1)} min")
 
-        # 2. Calcula novidade espectral — picos = transições
-        # Chroma novelty (mudanças harmônicas)
-        chroma_diff = np.sum(np.abs(np.diff(chroma, axis=1)), axis=0)
-        # MFCC novelty (mudanças timbrais)
-        mfcc_diff   = np.sum(np.abs(np.diff(mfcc, axis=1)), axis=0)
-        # Combina os dois sinais
-        min_len  = min(len(chroma_diff), len(mfcc_diff))
-        novelty  = chroma_diff[:min_len] * 0.6 + mfcc_diff[:min_len] * 0.4
-
-        # 3. Suaviza o sinal de novidade
-        from scipy.ndimage import uniform_filter1d
-        novelty_smooth = uniform_filter1d(novelty, size=int(sr * 5 / hop_length))  # janela de 5s
-
-        # 4. Normaliza
-        if novelty_smooth.max() > 0:
-            novelty_smooth = novelty_smooth / novelty_smooth.max()
-
-        # 5. Detecta picos acima do threshold
-        from scipy.signal import find_peaks
-        min_samples_between = int(min_track_duration * sr / hop_length)
-        peaks, props = find_peaks(
-            novelty_smooth,
-            height=0.35,           # threshold — só picos significativos
-            distance=min_samples_between,
-            prominence=0.15
+        # Extrai RMS a cada 1 segundo via ffmpeg (muito mais leve que librosa)
+        tmp_rms = audio_path + "_rms.txt"
+        os.system(
+            f'ffmpeg -i "{audio_path}" -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file={tmp_rms}" '
+            f'-f null - -loglevel quiet 2>/dev/null'
         )
 
-        # Converte frames para segundos
-        frame_times = librosa.frames_to_time(np.arange(len(novelty_smooth)),
-                                              sr=sr, hop_length=hop_length)
-        transition_times = [float(frame_times[p]) for p in peaks]
+        # Lê os valores RMS
+        rms_values = []
+        timestamps = []
+        if os.path.exists(tmp_rms):
+            with open(tmp_rms) as f:
+                for line in f:
+                    if "RMS_level" in line:
+                        try:
+                            val = float(line.strip().split("=")[1])
+                            if val > -100:  # ignora silêncio absoluto
+                                rms_values.append(val)
+                        except:
+                            pass
+            os.remove(tmp_rms)
 
-        # Filtra transições muito próximas do início ou fim
-        transition_times = [t for t in transition_times
-                           if t > min_track_duration and t < duration - min_track_duration]
+        if len(rms_values) < 10:
+            # Fallback: usa detecção simples por BPM estimado
+            print("[SPLIT] RMS insuficiente, usando divisão por tempo estimado")
+            # Estima ~3.5 min por faixa de techno/house
+            segment_time = 210  # 3.5 minutos
+            transitions = []
+            t = segment_time
+            while t < duration - min_track_duration:
+                transitions.append(t)
+                t += segment_time
+            return transitions
 
-        print(f"[SPLIT] {len(transition_times)} transições detectadas: {[round(t,1) for t in transition_times]}")
-        return transition_times
+        # Converte RMS para array numpy
+        rms = np.array(rms_values)
+        # Cada valor = ~1 frame de ffmpeg (aprox 1s)
+        frame_duration = duration / len(rms)
+
+        # Suaviza com janela de 10s
+        from scipy.ndimage import uniform_filter1d
+        rms_smooth = uniform_filter1d(rms, size=max(1, int(10 / frame_duration)))
+
+        # Detecta quedas bruscas de volume (= mixagem do DJ entrando)
+        # Diferença entre frames consecutivos
+        rms_diff = np.abs(np.diff(rms_smooth))
+
+        # Normaliza
+        if rms_diff.max() > 0:
+            rms_diff = rms_diff / rms_diff.max()
+
+        from scipy.signal import find_peaks
+        min_frames = int(min_track_duration / frame_duration)
+        peaks, _ = find_peaks(rms_diff, height=0.25, distance=min_frames, prominence=0.1)
+
+        transitions = []
+        for p in peaks:
+            t = p * frame_duration
+            if t > min_track_duration and t < duration - min_track_duration:
+                transitions.append(round(t, 1))
+
+        # Se não encontrou nada, divide em segmentos de 3.5 min
+        if not transitions:
+            print("[SPLIT] Sem transições detectadas, usando 3.5 min por faixa")
+            t = 210.0
+            while t < duration - min_track_duration:
+                transitions.append(round(t, 1))
+                t += 210.0
+
+        print(f"[SPLIT] {len(transitions)} transições: {transitions}")
+        return transitions
 
     except Exception as e:
-        print(f"[SPLIT] Erro na detecção: {e}")
+        print(f"[SPLIT] Erro: {e}")
+        import traceback; traceback.print_exc()
         return []
 
 
@@ -455,19 +488,27 @@ def process_job(job_id: str, input_path: str, folder: str):
     try:
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 0})
 
-        # Divide o set em segmentos de 3 minutos (simples e confiável)
-        print(f"[JOB] {job_id} — dividindo faixas...")
-        job_set(job_id, {"status": "processing", "tracks": [], "progress": 10,
-                         "stage": "Dividindo faixas..."})
-        output_pattern = folder + "/track_%03d.mp3"
-        os.system(
-            f'ffmpeg -i "{input_path}" -f segment -segment_time 180 '
-            f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{output_pattern}" -loglevel quiet'
-        )
-        track_paths = sorted(
-            os.path.join(folder, f) for f in os.listdir(folder)
-            if f.startswith("track_") and f.endswith(".mp3")
-        )
+        # 1. Detecta transições
+        print(f"[JOB] {job_id} — detectando transições...")
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
+                         "stage": "Detectando transições entre faixas..."})
+        transitions = detect_transitions(input_path, min_track_duration=120.0)
+
+        # 2. Divide nos pontos corretos
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 20,
+                         "stage": f"{len(transitions)} transições detectadas — dividindo faixas..."})
+        track_paths = split_by_transitions(input_path, folder, transitions)
+
+        if not track_paths:
+            output_pattern = folder + "/track_%03d.mp3"
+            os.system(
+                f'ffmpeg -i "{input_path}" -f segment -segment_time 180 '
+                f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{output_pattern}" -loglevel quiet'
+            )
+            track_paths = sorted(
+                os.path.join(folder, f) for f in os.listdir(folder)
+                if f.startswith("track_") and f.endswith(".mp3")
+            )
 
         total = len(track_paths)
         tracks = []
