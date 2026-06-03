@@ -567,22 +567,40 @@ def process_job(job_id: str, input_path: str, folder: str):
 
         def same_track(a, b):
             """Verifica se dois segmentos são da mesma música."""
+            # Se ambos são desconhecidos, considera mesma faixa (zona de transição)
+            if a["artist"] == "Desconhecido" and b["artist"] == "Desconhecido":
+                return True
+            # Se um é desconhecido, pode ser zona de mixagem — mantém no grupo atual
             if a["artist"] == "Desconhecido" or b["artist"] == "Desconhecido":
-                # Se um é desconhecido, verifica adjacência
-                return False
+                return True  # tolerante: desconhecido = provavelmente mesma faixa
             return (a["artist"].lower() == b["artist"].lower() and
                     a["title"].lower() == b["title"].lower())
 
-        # Monta grupos de segmentos contíguos da mesma música
+        # Monta grupos com lógica tolerante
+        # Um grupo só muda quando encontra 2 segmentos CONHECIDOS E DIFERENTES consecutivos
         groups = []
         current_group = [seg_identities[0]]
 
-        for seg in seg_identities[1:]:
-            if same_track(seg, current_group[-1]):
-                current_group.append(seg)
-            else:
-                groups.append(current_group)
-                current_group = [seg]
+        for i, seg in enumerate(seg_identities[1:], 1):
+            prev = current_group[-1]
+            
+            # Mudança de música = ambos conhecidos E diferentes
+            both_known = seg["known"] and prev["known"]
+            different   = not same_track(seg, prev) if both_known else False
+            
+            # Confirma mudança: precisa de 2 segmentos diferentes consecutivos
+            # para evitar falsos positivos
+            if different and i + 1 < len(seg_identities):
+                next_seg = seg_identities[i + 1] if i + 1 < len(seg_identities) else seg
+                confirmed = (next_seg["known"] and 
+                             next_seg["artist"].lower() == seg["artist"].lower())
+                if confirmed:
+                    groups.append(current_group)
+                    current_group = [seg]
+                    continue
+            
+            current_group.append(seg)
+        
         groups.append(current_group)
 
         print(f"[JOB] {len(groups)} grupos de músicas detectados")
