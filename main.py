@@ -211,111 +211,134 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
         tempo, beats = librosa.beat.beat_track(y=y_mono, sr=sr)
         beat_samples = [int(x) for x in librosa.frames_to_samples(np.array(beats).flatten())]
         tempo_val = float(np.array(tempo).flatten()[0])
-        print(f"[EXTEND] BPM: {round(tempo_val, 1)}")
+        print(f"[EXTEND] BPM detectado: {round(tempo_val, 1)}")
 
         if len(beat_samples) < 8:
-            seg_len = int(sr * 16)
+            seg_len = int(sr * 2)
             beat_samples = list(range(0, y_mono.shape[0], seg_len))
 
-        # 2. Separação de stems com Demucs — precisamos do stem de bateria
+        # 2. Separar bateria com Demucs (4stems para melhor qualidade)
         drums_audio = None
         try:
             stems_dir = os.path.join(tmp_dir, "stems")
             os.makedirs(stems_dir, exist_ok=True)
             result = subprocess.run(
-                ["python", "-m", "demucs", "--two-stems=drums",
-                 "-n", "htdemucs", "-o", stems_dir, tmp_wav],
-                capture_output=True, text=True, timeout=300
+                ["python", "-m", "demucs",
+                 "-n", "htdemucs",
+                 "--four-stems",
+                 "-o", stems_dir, tmp_wav],
+                capture_output=True, text=True, timeout=400
             )
+            print(f"[EXTEND] Demucs retornou: {result.returncode}")
+            # htdemucs salva em stems_dir/htdemucs/input/
             drums_path = os.path.join(stems_dir, "htdemucs", "input", "drums.wav")
             if os.path.exists(drums_path):
                 drums_audio, _ = librosa.load(drums_path, sr=44100, mono=False)
                 if drums_audio.ndim == 1:
                     drums_audio = np.stack([drums_audio, drums_audio])
-                print("[EXTEND] Demucs drums OK")
+                # Garante mesmo tamanho que a faixa original
+                min_len = min(y_full.shape[1], drums_audio.shape[1])
+                y_full = y_full[:, :min_len]
+                drums_audio = drums_audio[:, :min_len]
+                print(f"[EXTEND] Demucs drums OK — {round(min_len/sr, 1)}s")
             else:
-                print("[EXTEND] Demucs drums não encontrado, usando faixa completa")
+                print(f"[EXTEND] drums.wav não encontrado em {drums_path}")
+                # Lista o que foi gerado
+                for root, dirs, files in os.walk(stems_dir):
+                    for f in files:
+                        print(f"[EXTEND] Arquivo gerado: {os.path.join(root, f)}")
         except Exception as e:
             print(f"[EXTEND] Demucs erro: {e}")
 
-        # Se Demucs falhou, usa a faixa completa como drums (fallback)
+        # Fallback: se Demucs falhou, usa high-pass filter para simular bateria
         if drums_audio is None:
-            drums_audio = y_full.copy()
+            print("[EXTEND] Usando fallback — high-pass filter para simular bateria")
+            from scipy.signal import butter, sosfilt
+            def highpass(data, cutoff=200, fs=44100, order=4):
+                sos = butter(order, cutoff / (fs/2), btype='high', output='sos')
+                return sosfilt(sos, data)
+            drums_audio = np.stack([
+                highpass(y_full[0]),
+                highpass(y_full[1])
+            ])
 
-        # 3. Calcula quantos samples = 16 compassos (64 beats)
-        bars = 16
+        # 3. Calcula duração do loop de bateria — 16 compassos alinhados no beat
         beats_per_bar = 4
-        total_beats_needed = bars * beats_per_bar  # 64 beats
+        bars = 16
+        beats_needed = bars * beats_per_bar  # 64 beats ≈ 30s a 128BPM
 
-        # Pega os primeiros 64 beats alinhados da bateria (intro)
-        if len(beat_samples) > total_beats_needed:
-            intro_end_sample = int(beat_samples[total_beats_needed])
+        # Pega amostras alinhadas ao beat
+        if len(beat_samples) > beats_needed:
+            intro_len = int(beat_samples[beats_needed]) - int(beat_samples[0])
+            outro_len = int(beat_samples[-1]) - int(beat_samples[-(beats_needed+1)])
         else:
-            intro_end_sample = min(int(sr * 30), drums_audio.shape[1])
+            intro_len = int(sr * 30)
+            outro_len = int(sr * 30)
 
-        # Pega os últimos 64 beats alinhados da bateria (outro)
-        if len(beat_samples) > total_beats_needed:
-            outro_start_sample = int(beat_samples[-(total_beats_needed + 1)])
-        else:
-            outro_start_sample = max(0, drums_audio.shape[1] - int(sr * 30))
+        intro_len = min(intro_len, int(sr * 35), drums_audio.shape[1] // 3)
+        outro_len = min(outro_len, int(sr * 35), drums_audio.shape[1] // 3)
 
-        drums_intro = drums_audio[:, :intro_end_sample]
-        drums_outro = drums_audio[:, outro_start_sample:]
+        # 4. Extrai segmentos de bateria para intro e outro
+        # Intro: pega a bateria do MEIO da música (mais representativo do groove)
+        mid = drums_audio.shape[1] // 2
+        mid_start = int(beat_samples[len(beat_samples)//2]) if len(beat_samples) > beats_needed else mid
+        mid_start = max(0, mid_start)
+        mid_end   = min(drums_audio.shape[1], mid_start + intro_len)
+        drums_loop = drums_audio[:, mid_start:mid_end]
 
-        # 4. Crossfade suave de 4s nas junções intro→música e música→outro
-        fade_len = min(int(sr * 4), int(sr * 2))
-        fade_in  = np.linspace(0.0, 1.0, fade_len) ** 0.5
-        fade_out = np.linspace(1.0, 0.0, fade_len) ** 0.5
+        # 5. Monta a estrutura: [bateria intro] + [música] + [bateria outro]
+        fade_samples = min(int(sr * 2), intro_len // 4, outro_len // 4)
+        f_in  = np.linspace(0.0, 1.0, fade_samples)
+        f_out = np.linspace(1.0, 0.0, fade_samples)
 
-        # Intro: bateria solo com fade out no final
-        intro = drums_intro.copy()
-        intro[:, -fade_len:] *= fade_out
+        # Intro de bateria (sem fade in, começa direto; fade out no final)
+        intro_drum = drums_loop[:, :intro_len].copy()
+        intro_drum[:, -fade_samples:] = (
+            intro_drum[:, -fade_samples:] * f_out +
+            y_full[:, :fade_samples] * f_in
+        )
 
-        # Música completa com fade in no início e fade out no final
+        # Música completa (sem fade — não mexe no meio)
         music = y_full.copy()
-        music[:, :fade_len] *= fade_in
-        music[:, -fade_len:] *= fade_out
 
-        # Outro: bateria solo com fade in no início e fade out total no final
-        outro = drums_outro.copy()
-        outro[:, :fade_len] *= fade_in
-        # Fade out gradual no final do outro para terminar em silêncio suavemente
-        end_fade_len = min(int(sr * 8), outro.shape[1])
-        outro[:, -end_fade_len:] *= np.linspace(1.0, 0.0, end_fade_len) ** 0.5
+        # Outro de bateria (fade in no início; fade out suave no final)
+        outro_drum = drums_loop[:, :outro_len].copy()
+        outro_drum[:, :fade_samples] = (
+            y_full[:, -fade_samples:] * f_out +
+            outro_drum[:, :fade_samples] * f_in
+        )
+        # Fade out final suave (últimos 4s)
+        final_fade = min(int(sr * 4), outro_len)
+        outro_drum[:, -final_fade:] *= np.linspace(1.0, 0.0, final_fade)
 
-        # 5. Junta tudo com sobreposição nas junções
-        # intro → (overlap) → música completa → (overlap) → outro
-        overlap = fade_len
+        # 6. Concatena: intro_drum (com transição embutida) + música + outro_drum
+        # A transição já está embutida nos fades — sem sobreposição dupla
+        extended = np.concatenate([
+            intro_drum[:, :-fade_samples],   # intro sem os últimos fade_samples
+            y_full,                           # música completa
+            outro_drum[:, fade_samples:]      # outro sem os primeiros fade_samples
+        ], axis=1)
 
-        # Junção intro + música
-        intro_music = intro.copy()
-        music_start = music[:, :overlap].copy()
-        intro_music[:, -overlap:] += music_start
-        extended = np.concatenate([intro_music, music[:, overlap:]], axis=1)
-
-        # Junção música + outro
-        extended[:, -overlap:] += outro[:, :overlap]
-        extended = np.concatenate([extended, outro[:, overlap:]], axis=1)
-
-        # 6. Normaliza para evitar clipping
+        # 7. Normaliza
         peak = np.max(np.abs(extended))
         if peak > 0.95:
             extended = extended * (0.95 / peak)
 
-        # 7. Exporta como MP3 320kbps
+        # 8. Exporta
         combined_path = os.path.join(tmp_dir, "combined.wav")
         sf.write(combined_path, extended.T, sr, subtype="PCM_16")
-
         ret2 = os.system(
             f'ffmpeg -i "{combined_path}" -acodec libmp3lame -ab 320k -ar 44100 -y "{output_mp3}" -loglevel quiet'
         )
 
-        duration = extended.shape[1] / sr
-        print(f"[EXTEND] Concluído: {round(duration, 1)}s (intro 30s + música + outro 30s)")
+        total = extended.shape[1] / sr
+        print(f"[EXTEND] OK — {round(intro_len/sr,1)}s bateria + {round(y_full.shape[1]/sr,1)}s música + {round(outro_len/sr,1)}s bateria = {round(total,1)}s total")
         return ret2 == 0 and os.path.exists(output_mp3)
 
     except Exception as e:
-        print(f"[EXTEND] Erro: {e}")
+        print(f"[EXTEND] Erro fatal: {e}")
+        import traceback
+        traceback.print_exc()
         return False
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
