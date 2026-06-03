@@ -12,3 +12,4 @@ torchaudio
 demucs
 resampy
 soxr
+yt-dlp
