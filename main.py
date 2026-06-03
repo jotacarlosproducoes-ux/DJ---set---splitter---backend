@@ -455,31 +455,19 @@ def process_job(job_id: str, input_path: str, folder: str):
     try:
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 0})
 
-        # 1. Detecta transições inteligentes
-        print(f"[JOB] {job_id} — detectando transições...")
-        job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
-                         "stage": "Analisando espectro sonoro..."})
-        transitions = detect_transitions(input_path, min_track_duration=90.0)
-
-        # 2. Divide nos pontos corretos
-        job_set(job_id, {"status": "processing", "tracks": [], "progress": 20,
-                         "stage": f"{len(transitions)} transições detectadas — dividindo faixas..."})
-        track_paths = split_by_transitions(input_path, folder, transitions)
-
-        # Fallback: se não detectou nenhuma transição, divide em 3 minutos
-        if not track_paths:
-            print("[JOB] Nenhuma transição detectada, usando divisão por tempo")
-            job_set(job_id, {"status": "processing", "tracks": [], "progress": 20,
-                             "stage": "Usando divisão automática..."})
-            output_pattern = folder + "/track_%03d.mp3"
-            os.system(
-                f'ffmpeg -i "{input_path}" -f segment -segment_time 180 '
-                f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{output_pattern}" -loglevel quiet'
-            )
-            track_paths = sorted(
-                os.path.join(folder, f) for f in os.listdir(folder)
-                if f.startswith("track_") and f.endswith(".mp3")
-            )
+        # Divide o set em segmentos de 3 minutos (simples e confiável)
+        print(f"[JOB] {job_id} — dividindo faixas...")
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 10,
+                         "stage": "Dividindo faixas..."})
+        output_pattern = folder + "/track_%03d.mp3"
+        os.system(
+            f'ffmpeg -i "{input_path}" -f segment -segment_time 180 '
+            f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{output_pattern}" -loglevel quiet'
+        )
+        track_paths = sorted(
+            os.path.join(folder, f) for f in os.listdir(folder)
+            if f.startswith("track_") and f.endswith(".mp3")
+        )
 
         total = len(track_paths)
         tracks = []
