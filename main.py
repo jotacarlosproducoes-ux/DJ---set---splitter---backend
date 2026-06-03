@@ -171,37 +171,19 @@ def identify_song(audio_path: str, timestamp: float) -> dict:
 
 
 # ─── DETECÇÃO DE TRANSIÇÕES — Análise espectral pura ─────────────────────────
-def detect_transitions_spectral(audio_path: str, min_track_duration: float = 90.0) -> list[float]:
+def detect_transitions_spectral(audio_path: str, min_track_duration: float = 60.0) -> list[float]:
     """
     Detecta transições de músicas em um DJ set usando análise espectral pura.
-    NÃO depende de APIs externas para decidir os cortes.
-
-    Algoritmo:
-    1. Carrega o áudio em baixa resolução (11025Hz mono) para eficiência
-    2. Calcula 4 features por frame (~0.5s cada):
-       - RMS energy normalizada
-       - Spectral centroid (brilho do som)
-       - Spectral rolloff (distribuição de energia nas frequências)
-       - Zero-crossing rate (rugosidade do sinal)
-    3. Calcula a "distância espectral" entre janelas de 30s consecutivas
-       usando correlação cruzada — detecta quando o CARÁTER do áudio muda
-    4. Identifica zonas de transição (onde duas músicas se sobrepõem):
-       - RMS cresce enquanto espectro muda = DJ está fazendo a mix
-    5. Para cada zona de transição, encontra o ponto de DOMINÂNCIA:
-       o exato momento em que a nova música supera a anterior em energia
-    6. Alinha o corte ao beat mais próximo (usando beat tracking)
-    7. Aplica trim para limpar início/fim de cada faixa
-
-    Retorna lista de timestamps (em segundos) onde fazer os cortes.
+    Usa múltiplas janelas de comparação e thresholds adaptativos.
     """
     try:
         import librosa
-        from scipy.ndimage import uniform_filter1d, label
+        from scipy.ndimage import uniform_filter1d
         from scipy.signal import find_peaks
 
-        SR        = 11025   # baixa resolução — suficiente para análise de transições
-        HOP       = int(SR * 0.5)   # 1 frame = 0.5s
-        WIN       = int(SR * 2)     # janela de análise = 2s
+        SR  = 11025
+        HOP = int(SR * 0.5)   # 1 frame = 0.5s
+        WIN = int(SR * 2)
 
         print(f"[DETECT] Carregando {audio_path}...")
         y, sr = librosa.load(audio_path, sr=SR, mono=True, res_type="kaiser_fast")
@@ -212,140 +194,144 @@ def detect_transitions_spectral(audio_path: str, min_track_duration: float = 90.
             print("[DETECT] Áudio muito curto para ter transições")
             return []
 
-        # ── 1. Features espectrais por frame ─────────────────────────────────
-        rms       = librosa.feature.rms(y=y, hop_length=HOP, frame_length=WIN)[0]
-        centroid  = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP, n_fft=WIN)[0]
-        rolloff   = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=HOP, n_fft=WIN)[0]
-        zcr       = librosa.feature.zero_crossing_rate(y=y, hop_length=HOP, frame_length=WIN)[0]
+        # ── 1. Features espectrais ────────────────────────────────────────────
+        rms      = librosa.feature.rms(y=y, hop_length=HOP, frame_length=WIN)[0]
+        centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP, n_fft=WIN)[0]
+        rolloff  = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=HOP, n_fft=WIN)[0]
+        zcr      = librosa.feature.zero_crossing_rate(y=y, hop_length=HOP, frame_length=WIN)[0]
 
         n_frames = min(len(rms), len(centroid), len(rolloff), len(zcr))
-        rms      = rms[:n_frames]
-        centroid = centroid[:n_frames]
-        rolloff  = rolloff[:n_frames]
-        zcr      = zcr[:n_frames]
+        rms      = rms[:n_frames].astype(float)
+        centroid = centroid[:n_frames].astype(float)
+        rolloff  = rolloff[:n_frames].astype(float)
+        zcr      = zcr[:n_frames].astype(float)
 
-        def smooth_normalize(x, smooth_frames=20):
-            x = uniform_filter1d(x.astype(float), size=smooth_frames)
+        def smooth_normalize(x, smooth_frames=10):
+            x = uniform_filter1d(x, size=smooth_frames)
             mn, mx = x.min(), x.max()
             return (x - mn) / (mx - mn + 1e-9)
 
-        rms_n      = smooth_normalize(rms, smooth_frames=6)   # pouca suavização — queremos ver variações
+        rms_n      = smooth_normalize(rms, smooth_frames=4)
         centroid_n = smooth_normalize(centroid)
         rolloff_n  = smooth_normalize(rolloff)
         zcr_n      = smooth_normalize(zcr)
 
-        # ── 2. Distância espectral entre janelas de 60s ───────────────────────
-        # Compara o "perfil espectral" de janelas de 60s com as próximas 60s
-        # Uma mudança grande = transição de música
-        window_frames = int(60 / 0.5)   # 60s em frames
-        n = n_frames
+        # ── 2. Distância espectral em múltiplas escalas de janela ─────────────
+        # Usa 3 tamanhos de janela — captura transições lentas e rápidas
+        all_changes = []
+        for win_sec in [30, 60, 90]:
+            wf = int(win_sec / 0.5)
+            change = np.zeros(n_frames)
+            for i in range(wf, n_frames - wf):
+                prev = np.array([
+                    centroid_n[i - wf:i].mean(),
+                    rolloff_n[i - wf:i].mean(),
+                    zcr_n[i - wf:i].mean(),
+                ])
+                nxt = np.array([
+                    centroid_n[i:i + wf].mean(),
+                    rolloff_n[i:i + wf].mean(),
+                    zcr_n[i:i + wf].mean(),
+                ])
+                change[i] = float(np.linalg.norm(nxt - prev))
+            all_changes.append(smooth_normalize(change, smooth_frames=6))
 
-        spectral_change = np.zeros(n)
-        for i in range(window_frames, n - window_frames):
-            # Janela anterior vs janela posterior
-            prev = np.array([
-                centroid_n[i - window_frames:i].mean(),
-                rolloff_n[i - window_frames:i].mean(),
-                zcr_n[i - window_frames:i].mean(),
-            ])
-            nxt = np.array([
-                centroid_n[i:i + window_frames].mean(),
-                rolloff_n[i:i + window_frames].mean(),
-                zcr_n[i:i + window_frames].mean(),
-            ])
-            spectral_change[i] = float(np.linalg.norm(nxt - prev))
-
-        spectral_change = smooth_normalize(spectral_change, smooth_frames=10)
+        # Combina as 3 escalas com peso maior para janela média (60s)
+        spectral_change = (all_changes[0] * 0.25 + all_changes[1] * 0.5 + all_changes[2] * 0.25)
+        spectral_change = smooth_normalize(spectral_change, smooth_frames=4)
 
         # ── 3. Score de transição ─────────────────────────────────────────────
-        # Transição = mudança espectral alta + energia em nível razoável
-        # (não é silêncio, mas também não é pico — é a zona de mix)
-        rms_mid = 1.0 - np.abs(rms_n - 0.5) * 2   # máximo quando RMS está no meio
-        transition_score = spectral_change * 0.7 + rms_mid * 0.3
+        # Zona de mix = mudança espectral alta + RMS não está no silêncio
+        rms_active = np.where(rms_n > 0.1, 1.0, 0.0)   # exclui silêncios
+        transition_score = spectral_change * rms_active
         transition_score = smooth_normalize(transition_score, smooth_frames=4)
 
-        # ── 4. Detecta picos de transição ────────────────────────────────────
+        # ── 4. Threshold ADAPTATIVO ───────────────────────────────────────────
+        # Em vez de threshold fixo, usa percentil do próprio sinal
+        # assim funciona independente da intensidade das mudanças
+        adaptive_threshold = float(np.percentile(transition_score, 70))
+        adaptive_threshold = max(0.20, min(adaptive_threshold, 0.55))
+        print(f"[DETECT] Threshold adaptativo: {round(adaptive_threshold, 3)}")
+
         min_dist_frames = int(min_track_duration / 0.5)
 
         peaks, props = find_peaks(
             transition_score,
-            height=0.35,
+            height=adaptive_threshold,
             distance=min_dist_frames,
-            prominence=0.15,
+            prominence=0.08,   # baixo — não filtra demais
         )
 
         frame_times = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=HOP)
+        print(f"[DETECT] {len(peaks)} picos encontrados com threshold {round(adaptive_threshold, 3)}")
 
-        print(f"[DETECT] {len(peaks)} picos de transição encontrados")
-
+        # ── 5. Se ainda não achou nada, tenta com threshold menor ─────────────
         if len(peaks) == 0:
-            # Fallback: nenhuma transição clara — divide em fatias de 4min
-            print("[DETECT] Sem transições claras — usando fallback 4min")
+            fallback_threshold = float(np.percentile(transition_score, 50))
+            print(f"[DETECT] Tentando threshold menor: {round(fallback_threshold, 3)}")
+            peaks, _ = find_peaks(
+                transition_score,
+                height=fallback_threshold,
+                distance=min_dist_frames,
+                prominence=0.05,
+            )
+            print(f"[DETECT] {len(peaks)} picos com threshold reduzido")
+
+        # ── 6. Se ainda zero, fallback por tempo ──────────────────────────────
+        if len(peaks) == 0:
+            print("[DETECT] Sem transições detectadas — fallback 3.5min")
             fallback = []
-            t = 240.0
+            t = 210.0
             while t < total_duration - min_track_duration:
                 fallback.append(round(t, 1))
-                t += 240.0
+                t += 210.0
             return fallback
 
-        # ── 5. Para cada pico, encontra o ponto de dominância ────────────────
-        # Em uma zona de mix, a nova música começa a dominar quando
-        # o spectral centroid começa a CONVERGIR para um novo valor estável
-        # Usamos o ponto onde a derivada do centroid muda de sinal
-
-        # Beat tracking para alinhar cortes
+        # ── 7. Beat tracking para alinhar cortes ──────────────────────────────
         tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP)
         beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=HOP)
         tempo_val  = float(np.array(tempo).flatten()[0])
-        print(f"[DETECT] BPM detectado: {round(tempo_val, 1)}")
+        print(f"[DETECT] BPM: {round(tempo_val, 1)}")
 
         transitions = []
         for peak_idx in peaks:
-            t_peak = float(frame_times[peak_idx])
+            t_peak = float(frame_times[min(int(peak_idx), n_frames - 1)])
 
-            # Janela de busca: ±45s ao redor do pico
-            search_start = max(0, t_peak - 45)
-            search_end   = min(total_duration, t_peak + 45)
+            # Ponto de corte = pico de mudança espectral
+            # Refina buscando mínima variância local (±30s)
+            f_start = max(0, int(peak_idx) - int(30 / 0.5))
+            f_end   = min(n_frames, int(peak_idx) + int(30 / 0.5))
+            t_cut   = t_peak
 
-            # Dentro da janela, procura o ponto onde o spectral centroid
-            # tem menor variância (sinal mais "estável" = nova música já domina)
-            f_start = max(0, peak_idx - int(45 / 0.5))
-            f_end   = min(n_frames, peak_idx + int(45 / 0.5))
-
-            if f_end - f_start < 4:
-                t_cut = t_peak
-            else:
-                # Calcula variância local do centroid em janelas de 10s
+            if f_end - f_start > 8:
                 var_window = int(10 / 0.5)
-                local_var  = np.array([
-                    centroid_n[i:i+var_window].var()
-                    for i in range(f_start, f_end - var_window)
-                ])
-                # Ponto de mínima variância = música mais estável = corte ideal
-                min_var_idx = f_start + int(np.argmin(local_var)) + var_window // 2
-                t_cut = float(frame_times[min(min_var_idx, n_frames - 1)])
+                if f_end - var_window > f_start:
+                    local_var = np.array([
+                        centroid_n[i:i+var_window].var()
+                        for i in range(f_start, f_end - var_window)
+                    ])
+                    min_var_idx = f_start + int(np.argmin(local_var)) + var_window // 2
+                    t_cut = float(frame_times[min(min_var_idx, n_frames - 1)])
 
-            # Garante que está dentro dos limites
             t_cut = max(min_track_duration, min(total_duration - min_track_duration, t_cut))
 
-            # Alinha ao beat mais próximo (dentro de 3s)
+            # Alinha ao beat mais próximo (dentro de 4s)
             if len(beat_times) > 0:
                 diffs = np.abs(beat_times - t_cut)
                 closest_idx = int(np.argmin(diffs))
-                if diffs[closest_idx] < 3.0:
-                    # Prefere beats que são início de compasso (a cada 4 beats)
+                if diffs[closest_idx] < 4.0:
                     bar_beats = beat_times[::4] if len(beat_times) > 4 else beat_times
                     diffs_bar = np.abs(bar_beats - t_cut)
                     closest_bar = int(np.argmin(diffs_bar))
-                    if diffs_bar[closest_bar] < 3.0:
+                    if diffs_bar[closest_bar] < 4.0:
                         t_cut = float(bar_beats[closest_bar])
                     else:
                         t_cut = float(beat_times[closest_idx])
 
             transitions.append(round(t_cut, 2))
-            print(f"[DETECT] Transição @ {round(t_cut/60, 2)} min (pico em {round(t_peak/60, 2)} min)")
+            print(f"[DETECT] Transição @ {round(t_cut/60, 2)} min")
 
-        # Remove duplicatas (cortes muito próximos = < min_track_duration)
+        # Remove duplicatas muito próximas
         transitions.sort()
         filtered = [transitions[0]]
         for t in transitions[1:]:
@@ -358,7 +344,6 @@ def detect_transitions_spectral(audio_path: str, min_track_duration: float = 90.
     except Exception as e:
         print(f"[DETECT] Erro fatal: {e}")
         import traceback; traceback.print_exc()
-        # Fallback seguro
         try:
             result = os.popen(
                 f'ffprobe -v error -show_entries format=duration '
@@ -366,10 +351,10 @@ def detect_transitions_spectral(audio_path: str, min_track_duration: float = 90.
             ).read().strip()
             duration = float(result) if result else 3600
             fallback = []
-            t = 240.0
-            while t < duration - 90:
+            t = 210.0
+            while t < duration - 60:
                 fallback.append(round(t, 1))
-                t += 240.0
+                t += 210.0
             return fallback
         except:
             return []
@@ -614,7 +599,7 @@ def process_job(job_id: str, input_path: str, folder: str):
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
                          "stage": "Analisando espectro do set (pode levar 1-2 min)..."})
 
-        transitions = detect_transitions_spectral(input_path, min_track_duration=90.0)
+        transitions = detect_transitions_spectral(input_path, min_track_duration=60.0)
 
         n_tracks_expected = len(transitions) + 1
         print(f"[JOB] {len(transitions)} transições → {n_tracks_expected} faixas esperadas")
