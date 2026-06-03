@@ -640,14 +640,20 @@ def process_job(job_id: str, input_path: str, folder: str):
             trim_end_duration = raw_duration
 
             if i > 0:
-                # Remove zona de mix do início (busca nos primeiros 30s)
-                trim_start_offset = find_clean_start(raw_path, search_seconds=30.0)
-                print(f"[JOB] Faixa {i}: trim início = +{trim_start_offset}s")
+                detected_start = find_clean_start(raw_path, search_seconds=30.0)
+                if 1.0 <= detected_start <= 20.0:
+                    trim_start_offset = detected_start
+                    print(f"[JOB] Faixa {i}: trim início = +{trim_start_offset}s")
+                else:
+                    print(f"[JOB] Faixa {i}: trim início ignorado ({detected_start}s), usando 0s")
 
             if i < len(segments) - 1:
-                # Remove zona de mix do final (busca nos últimos 30s)
-                trim_end_duration = find_clean_end(raw_path, search_seconds=30.0)
-                print(f"[JOB] Faixa {i}: trim fim = {trim_end_duration}s (de {round(raw_duration, 1)}s)")
+                detected_end = find_clean_end(raw_path, search_seconds=30.0)
+                if detected_end > raw_duration * 0.5 and detected_end > 30.0:
+                    trim_end_duration = detected_end
+                    print(f"[JOB] Faixa {i}: trim fim = {trim_end_duration}s (de {round(raw_duration, 1)}s)")
+                else:
+                    print(f"[JOB] Faixa {i}: trim fim ignorado ({detected_end}s), usando {round(raw_duration,1)}s")
 
             clean_duration = trim_end_duration - trim_start_offset
 
