@@ -38,35 +38,33 @@ R2_ENDPOINT          = os.environ.get("R2_ENDPOINT", "")
 R2_BUCKET            = os.environ.get("R2_BUCKET", "djsetsplitter")
 REDIS_URL            = os.environ.get("REDIS_URL", "")
 
-# ─── Redis ────────────────────────────────────────────────────────────────────
-def get_redis():
-    if not REDIS_URL:
-        return None
-    try:
-        r = redis.from_url(REDIS_URL, decode_responses=True)
-        r.ping()
-        return r
-    except Exception as e:
-        print(f"[REDIS] Erro: {e}")
-        return None
+# ─── Job storage (arquivo JSON — simples e confiável) ────────────────────────
+JOBS_DIR = "jobs"
+os.makedirs(JOBS_DIR, exist_ok=True)
 
 def job_set(job_id: str, data: dict):
-    r = get_redis()
-    if r:
-        import json
-        r.setex(f"job:{job_id}", 86400, json.dumps(data))  # expira em 24h
-    else:
-        jobs[job_id] = data
+    import json
+    try:
+        path = os.path.join(JOBS_DIR, f"{job_id}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[JOB] Erro ao salvar job: {e}")
 
 def job_get(job_id: str) -> dict | None:
-    r = get_redis()
-    if r:
-        import json
-        val = r.get(f"job:{job_id}")
-        return json.loads(val) if val else None
-    return jobs.get(job_id)
+    import json
+    try:
+        path = os.path.join(JOBS_DIR, f"{job_id}.json")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[JOB] Erro ao ler job: {e}")
+    return None
 
-# Fallback local se Redis não disponível
+def get_redis():
+    return None
+
 jobs = {}
 
 # ─── R2 ───────────────────────────────────────────────────────────────────────
@@ -613,22 +611,10 @@ async def split_audio(background_tasks: BackgroundTasks, file: UploadFile = File
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    # Tenta Redis primeiro
-    r = get_redis()
-    if r:
-        import json
-        val = r.get(f"job:{job_id}")
-        if val:
-            return json.loads(val)
-        # Chave não encontrada no Redis — verifica fallback local
-        print(f"[STATUS] job:{job_id} não encontrado no Redis")
-        print(f"[STATUS] Keys no Redis: {r.keys('job:*')[:5]}")
-    
-    # Fallback local
-    if job_id in jobs:
-        return jobs[job_id]
-    
-    return {"error": "Job nao encontrado", "redis": bool(r), "local_jobs": len(jobs)}
+    data = job_get(job_id)
+    if not data:
+        return {"error": "Job nao encontrado"}
+    return data
 
 
 @app.get("/download/{job_id}/{filename}")
