@@ -499,72 +499,174 @@ def split_by_transitions(input_path: str, folder: str, transitions: list) -> lis
 
 # ─── Processamento em background ─────────────────────────────────────────────
 def process_job(job_id: str, input_path: str, folder: str):
-    """Processa o job em background — detecta transições, divide, identifica e salva no R2."""
+    """
+    Divide o set usando identificação inteligente:
+    1. Divide em segmentos de 30s
+    2. Identifica cada segmento com ACRCloud + AudD
+    3. Agrupa segmentos consecutivos da mesma música
+    4. Corta nos pontos de mudança de música
+    5. Salva no R2
+    """
     try:
-        job_set(job_id, {"status": "processing", "tracks": [], "progress": 0})
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 0,
+                         "stage": "Iniciando análise..."})
 
-        # 1. Detecta transições
-        print(f"[JOB] {job_id} — detectando transições...")
+        # Duração total
+        result = os.popen(
+            f'ffprobe -v error -show_entries format=duration '
+            f'-of default=noprint_wrappers=1:nokey=1 "{input_path}"'
+        ).read().strip()
+        total_duration = float(result) if result else 0
+        if total_duration == 0:
+            raise Exception("Não foi possível determinar a duração do arquivo")
+
+        print(f"[JOB] Duração total: {round(total_duration/60, 1)} min")
+
+        # 1. Divide em segmentos de 30s para identificação
+        segment_duration = 30
+        segments_folder = folder + "/segments"
+        os.makedirs(segments_folder, exist_ok=True)
+
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
-                         "stage": "Detectando transições entre faixas..."})
-        transitions = detect_transitions(input_path, min_track_duration=120.0)
+                         "stage": "Dividindo em segmentos para análise..."})
 
-        # 2. Divide nos pontos corretos
-        job_set(job_id, {"status": "processing", "tracks": [], "progress": 20,
-                         "stage": f"{len(transitions)} transições detectadas — dividindo faixas..."})
-        track_paths = split_by_transitions(input_path, folder, transitions)
+        os.system(
+            f'ffmpeg -i "{input_path}" -f segment -segment_time {segment_duration} '
+            f'-vn -acodec mp3 -ab 192k -ar 44100 -y "{segments_folder}/seg_%04d.mp3" -loglevel quiet'
+        )
 
-        if not track_paths:
-            output_pattern = folder + "/track_%03d.mp3"
-            os.system(
-                f'ffmpeg -i "{input_path}" -f segment -segment_time 180 '
-                f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{output_pattern}" -loglevel quiet'
-            )
-            track_paths = sorted(
-                os.path.join(folder, f) for f in os.listdir(folder)
-                if f.startswith("track_") and f.endswith(".mp3")
-            )
+        segment_files = sorted(
+            f for f in os.listdir(segments_folder) if f.startswith("seg_") and f.endswith(".mp3")
+        )
+        total_segs = len(segment_files)
+        print(f"[JOB] {total_segs} segmentos de 30s para analisar")
 
-        total = len(track_paths)
+        # 2. Identifica cada segmento
+        seg_identities = []
+        for i, seg_file in enumerate(segment_files):
+            seg_path = os.path.join(segments_folder, seg_file)
+            ts = i * segment_duration
+            progress = 5 + int((i / total_segs) * 60)
+            job_set(job_id, {"status": "processing", "tracks": [], "progress": progress,
+                             "stage": f"Identificando segmento {i+1} de {total_segs}..."})
+
+            info = identify_song(seg_path, ts)
+            seg_identities.append({
+                "index": i,
+                "start": ts,
+                "end": min(ts + segment_duration, total_duration),
+                "artist": info["artist"],
+                "title": info["title"],
+                "known": info["artist"] != "Desconhecido"
+            })
+            print(f"[JOB] Seg {i+1}/{total_segs} @ {round(ts/60,1)}min: {info['artist']} - {info['title']}")
+
+        # 3. Agrupa segmentos consecutivos da mesma música
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 70,
+                         "stage": "Agrupando faixas identificadas..."})
+
+        def same_track(a, b):
+            """Verifica se dois segmentos são da mesma música."""
+            if a["artist"] == "Desconhecido" or b["artist"] == "Desconhecido":
+                # Se um é desconhecido, verifica adjacência
+                return False
+            return (a["artist"].lower() == b["artist"].lower() and
+                    a["title"].lower() == b["title"].lower())
+
+        # Monta grupos de segmentos contíguos da mesma música
+        groups = []
+        current_group = [seg_identities[0]]
+
+        for seg in seg_identities[1:]:
+            if same_track(seg, current_group[-1]):
+                current_group.append(seg)
+            else:
+                groups.append(current_group)
+                current_group = [seg]
+        groups.append(current_group)
+
+        print(f"[JOB] {len(groups)} grupos de músicas detectados")
+
+        # 4. Para cada grupo, determina o nome mais comum e os limites
+        # Margem de 5s: remove a zona de mixagem do início e fim de cada faixa
+        MARGIN = 5.0
+
         tracks = []
+        for i, group in enumerate(groups):
+            start_time = group[0]["start"]
+            end_time   = group[-1]["end"]
+            duration   = end_time - start_time
 
-        # 3. Identifica cada faixa
-        for i, track_path in enumerate(sorted(track_paths)):
-            fname    = os.path.basename(track_path)
-            track_id = fname.replace(".mp3", "")
-            ts       = i * 180
+            # Ignora segmentos muito curtos (< 60s = provavelmente zona de mixagem)
+            if duration < 60:
+                print(f"[JOB] Grupo {i} muito curto ({round(duration)}s), ignorando")
+                continue
 
-            progress = 20 + int((i / total) * 70)
-            job_set(job_id, {"status": "processing", "tracks": tracks, "progress": progress,
-                             "stage": f"Identificando faixa {i+1} de {total}..."})
+            # Nome mais frequente no grupo (ignora desconhecidos)
+            known = [s for s in group if s["known"]]
+            if known:
+                # Pega o nome do segmento do meio do grupo (mais limpo)
+                mid_seg = known[len(known)//2]
+                artist = mid_seg["artist"]
+                title  = mid_seg["title"]
+            else:
+                artist = "Desconhecido"
+                title  = f"Faixa {round(start_time)}s"
 
-            info         = identify_song(track_path, ts)
-            display_name = info["artist"] + " - " + info["title"]
+            display_name = artist + " - " + title
+            fname        = f"track_{i:03d}.mp3"
+            track_path   = os.path.join(folder, fname)
+
+            # Aplica margem para remover zona de mixagem
+            cut_start = max(0, start_time + MARGIN) if i > 0 else start_time
+            cut_end   = min(total_duration, end_time - MARGIN) if i < len(groups)-1 else end_time
+            cut_dur   = cut_end - cut_start
+
+            if cut_dur < 30:
+                print(f"[JOB] Faixa {i} muito curta após margem ({round(cut_dur)}s), ignorando")
+                continue
+
+            # Exporta o segmento
+            ret = os.system(
+                f'ffmpeg -ss {cut_start} -t {cut_dur} -i "{input_path}" '
+                f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{track_path}" -loglevel quiet'
+            )
+
+            if ret != 0 or not os.path.exists(track_path):
+                print(f"[JOB] Erro ao exportar faixa {i}")
+                continue
 
             # Upload para R2
             r2_key = f"{job_id}/{fname}"
             upload_to_r2(track_path, r2_key)
 
             tracks.append({
-                "id":           track_id,
+                "id":           fname.replace(".mp3", ""),
                 "name":         display_name,
-                "artist":       info["artist"],
-                "title":        info["title"],
-                "timestamp":    ts,
+                "artist":       artist,
+                "title":        title,
+                "timestamp":    int(cut_start),
+                "duration":     round(cut_dur, 1),
                 "url":          f"/download/{job_id}/{fname}",
                 "url_mp3":      f"/download/{job_id}/{fname}?format=mp3",
                 "url_wav":      f"/download/{job_id}/{fname}?format=wav",
                 "url_extended": f"/download/{job_id}/{fname}?format=extended",
             })
 
+            progress = 70 + int((i / len(groups)) * 25)
+            job_set(job_id, {"status": "processing", "tracks": tracks, "progress": progress,
+                             "stage": f"Processando faixa {i+1} de {len(groups)}..."})
+
+        # Limpa segmentos temporários
+        shutil.rmtree(segments_folder, ignore_errors=True)
+
         job_set(job_id, {"status": "done", "tracks": tracks, "progress": 100,
-                         "stage": "Concluído!"})
-        print(f"[JOB] {job_id} concluído — {total} faixas")
+                         "stage": f"Concluído — {len(tracks)} faixas identificadas!"})
+        print(f"[JOB] {job_id} concluído — {len(tracks)} faixas")
 
     except Exception as e:
         print(f"[JOB] Erro: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         job_set(job_id, {"status": "error", "error": str(e), "tracks": []})
 
 
