@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Request, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.responses import FileResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 import uuid, os, shutil, asyncio, requests, hmac, hashlib, base64, time, urllib.parse
@@ -536,6 +536,61 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/upload-chunk")
+async def upload_chunk(
+    background_tasks: BackgroundTasks,
+    chunk: UploadFile = File(...),
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    filename: str = Form(...)
+):
+    """
+    Recebe chunks de arquivo e quando todos chegarem, inicia o processamento.
+    Suporta internet lenta — cada chunk de 5MB tem 2 minutos de timeout.
+    """
+    # Pasta para os chunks deste upload
+    chunks_folder = f"uploads/{upload_id}"
+    os.makedirs(chunks_folder, exist_ok=True)
+
+    # Salva o chunk
+    chunk_path = f"{chunks_folder}/chunk_{chunk_index:04d}"
+    with open(chunk_path, "wb") as f:
+        shutil.copyfileobj(chunk.file, f)
+
+    print(f"[CHUNK] {upload_id} — chunk {chunk_index+1}/{total_chunks} recebido")
+
+    # Verifica se todos os chunks chegaram
+    received = len([f for f in os.listdir(chunks_folder) if f.startswith("chunk_")])
+    if received < total_chunks:
+        return {"status": "uploading", "received": received, "total": total_chunks}
+
+    # Todos os chunks chegaram — junta o arquivo
+    job_id = str(uuid.uuid4())
+    folder = f"outputs/{job_id}"
+    os.makedirs(folder, exist_ok=True)
+
+    input_path = f"{folder}/input.mp3"
+    print(f"[CHUNK] Juntando {total_chunks} chunks em {input_path}")
+
+    with open(input_path, "wb") as out:
+        for i in range(total_chunks):
+            chunk_file = f"{chunks_folder}/chunk_{i:04d}"
+            with open(chunk_file, "rb") as cf:
+                shutil.copyfileobj(cf, out)
+
+    # Limpa chunks
+    shutil.rmtree(chunks_folder, ignore_errors=True)
+
+    # Inicia processamento em background
+    job_set(job_id, {"status": "processing", "tracks": [], "progress": 0,
+                     "stage": "Arquivo recebido, iniciando análise..."})
+    background_tasks.add_task(process_job, job_id, input_path, folder)
+
+    print(f"[CHUNK] Upload completo — job {job_id} iniciado")
+    return {"status": "done", "job_id": job_id}
 
 
 @app.post("/split")
