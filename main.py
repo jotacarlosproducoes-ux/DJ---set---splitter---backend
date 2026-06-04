@@ -2,11 +2,17 @@ from fastapi import FastAPI, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.responses import FileResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 import uuid, os, shutil, asyncio, requests, hmac, hashlib, base64, time, urllib.parse
+import sys
 import numpy as np
 import boto3
 from botocore.config import Config
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
+
+# Força stdout/stderr sem buffer — garante que os logs apareçam em tempo real
+# no Render (sem isso, prints dentro de threads podem nunca aparecer).
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 # Pool de threads para o processamento pesado.
 # librosa, numpy, scipy e ffmpeg liberam o GIL durante operações pesadas,
@@ -589,6 +595,7 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
 # PIPELINE PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 def process_job(job_id: str, input_path: str, folder: str):
+    print(f"[JOB] >>> process_job INICIADO para {job_id}", flush=True)
     try:
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 2,
                          "stage": "Iniciando análise espectral..."})
@@ -596,7 +603,7 @@ def process_job(job_id: str, input_path: str, folder: str):
         total_duration = _get_duration(input_path)
         if total_duration == 0:
             raise Exception("Não foi possível determinar a duração do arquivo")
-        print(f"[JOB] Duração total: {round(total_duration/60, 1)} min")
+        print(f"[JOB] Duração total: {round(total_duration/60, 1)} min", flush=True)
 
         # ── Etapa 1: Detecção de transições ──────────────────────────────────
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
@@ -782,6 +789,7 @@ class URLRequest(BaseModel):
 
 def download_and_process(job_id: str, url: str, folder: str):
     """Baixa o áudio da URL com yt-dlp e dispara o pipeline de processamento."""
+    import subprocess
     try:
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 1,
                          "stage": "Baixando áudio da URL..."})
@@ -790,44 +798,47 @@ def download_and_process(job_id: str, url: str, folder: str):
 
         # Caminho de cookies opcional (ajuda a contornar bloqueio do YouTube)
         cookies_file = os.environ.get("YTDLP_COOKIES", "")
-        cookies_arg  = f'--cookies "{cookies_file}"' if cookies_file and os.path.exists(cookies_file) else ""
 
-        # yt-dlp: baixa melhor áudio e converte para MP3
-        # Funciona com YouTube E SoundCloud (mesma ferramenta)
-        # -N 8: baixa 8 fragmentos em paralelo (SoundCloud usa HLS fragmentado,
-        #       sem isso o download fica lento — ETA de 12+ min vira ~2 min)
-        cmd = (
-            f'yt-dlp {cookies_arg} '
-            f'-f "bestaudio/best" '
-            f'-N 8 '
-            f'--extract-audio --audio-format mp3 --audio-quality 0 '
-            f'--no-playlist '
-            f'--no-warnings '
-            f'-o "{folder}/input.%(ext)s" '
-            f'"{url}"'
-        )
-        print(f"[URL] Baixando: {url}")
-        ret = os.system(cmd)
+        # Monta argumentos como lista (mais seguro que string em thread)
+        cmd = ["yt-dlp"]
+        if cookies_file and os.path.exists(cookies_file):
+            cmd += ["--cookies", cookies_file]
+        cmd += [
+            "-f", "bestaudio/best",
+            "-N", "8",
+            "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+            "--no-playlist", "--no-warnings",
+            "-o", f"{folder}/input.%(ext)s",
+            url,
+        ]
+
+        print(f"[URL] Baixando: {url}", flush=True)
+        # subprocess.run é seguro em threads (os.system pode travar com signals)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        ret = result.returncode
+        if ret != 0:
+            print(f"[URL] yt-dlp stderr: {result.stderr[-500:]}", flush=True)
 
         # yt-dlp pode salvar como input.mp3 diretamente
         if not os.path.exists(input_path):
-            # Procura qualquer arquivo input.* gerado
             for f in os.listdir(folder):
                 if f.startswith("input."):
                     found = os.path.join(folder, f)
                     if not f.endswith(".mp3"):
-                        # Converte para mp3
-                        os.system(f'ffmpeg -i "{found}" -acodec mp3 -ab 320k -y "{input_path}" -loglevel quiet')
-                        os.remove(found)
+                        subprocess.run(
+                            ["ffmpeg", "-i", found, "-acodec", "mp3", "-ab", "320k",
+                             "-y", input_path, "-loglevel", "quiet"],
+                            capture_output=True, timeout=300)
+                        if os.path.exists(found): os.remove(found)
                     else:
                         input_path = found
                     break
 
-        if ret != 0 or not os.path.exists(input_path):
+        if not os.path.exists(input_path):
             raise Exception("Falha ao baixar o áudio da URL. O link pode estar bloqueado ou ser privado.")
 
         size_mb = os.path.getsize(input_path) / (1024 * 1024)
-        print(f"[URL] Download OK — {round(size_mb, 1)}MB")
+        print(f"[URL] Download OK — {round(size_mb, 1)}MB", flush=True)
 
         # Dispara o pipeline normal
         process_job(job_id, input_path, folder)
