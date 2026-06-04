@@ -335,28 +335,76 @@ def detect_transitions(audio_path: str, min_track_duration: float = 60.0) -> lis
                  _normalize(high[:n], smooth=8) * 0.10)
         score = _normalize(score, smooth=4)
 
-        # ── Threshold adaptativo (percentil 72) ──────────────────────────────
-        threshold = float(np.clip(np.percentile(score, 72), 0.22, 0.58))
+        # ── Threshold adaptativo ──────────────────────────────────────────────
+        # Percentil 68 (era 72) — um pouco mais sensível para pegar transições suaves
+        threshold = float(np.clip(np.percentile(score, 68), 0.20, 0.55))
         min_dist  = int(min_track_duration / 0.5)
-        print(f"[DETECT] Threshold: {round(threshold, 3)}")
+        print(f"[DETECT] Threshold: {round(threshold, 3)}", flush=True)
 
-        peaks, _ = find_peaks(score, height=threshold, distance=min_dist, prominence=0.08)
+        peaks, _ = find_peaks(score, height=threshold, distance=min_dist, prominence=0.07)
 
         # Segunda tentativa com threshold menor se necessário
         if len(peaks) == 0:
             threshold2 = float(np.percentile(score, 55))
-            print(f"[DETECT] Re-tentando com threshold {round(threshold2, 3)}")
+            print(f"[DETECT] Re-tentando com threshold {round(threshold2, 3)}", flush=True)
             peaks, _ = find_peaks(score, height=threshold2, distance=min_dist, prominence=0.05)
 
         frame_times = librosa.frames_to_time(np.arange(n), sr=sr, hop_length=HOP)
-        print(f"[DETECT] {len(peaks)} picos encontrados")
+        print(f"[DETECT] {len(peaks)} picos na 1ª passada", flush=True)
 
-        if len(peaks) == 0:
-            print("[DETECT] Fallback: 3.5 min por faixa")
+        # ── 2ª PASSADA: procura transições em GAPS LONGOS ─────────────────────
+        # Se ficou algum trecho > 7min sem corte, provavelmente há músicas
+        # grudadas lá (transições suaves que o threshold global perdeu).
+        # Roda uma detecção LOCAL mais sensível só nesse trecho.
+        MAX_GAP_SEC = 420  # 7 minutos
+        peak_times_sorted = sorted([float(frame_times[min(int(p), n-1)]) for p in peaks])
+        gap_edges = [0.0] + peak_times_sorted + [total]
+        extra_cuts = []
+
+        for gi in range(len(gap_edges) - 1):
+            g_start = gap_edges[gi]
+            g_end   = gap_edges[gi + 1]
+            gap_dur = g_end - g_start
+            if gap_dur <= MAX_GAP_SEC:
+                continue
+
+            # Analisa o score só nesse trecho com threshold local mais baixo
+            f0 = int(g_start / 0.5)
+            f1 = int(g_end / 0.5)
+            if f1 - f0 < min_dist * 2:
+                continue
+
+            local_score = score[f0:f1]
+            local_thresh = float(np.percentile(local_score, 60))
+            local_peaks, _ = find_peaks(
+                local_score,
+                height=local_thresh,
+                distance=min_dist,
+                prominence=0.05
+            )
+            for lp in local_peaks:
+                t_local = float(frame_times[min(f0 + int(lp), n - 1)])
+                # Evita cortes muito perto das bordas do gap
+                if t_local - g_start > min_track_duration and g_end - t_local > min_track_duration:
+                    extra_cuts.append(t_local)
+
+            if local_peaks.size > 0:
+                print(f"[DETECT] Gap longo {round(g_start/60,1)}-{round(g_end/60,1)}min: "
+                      f"+{len(local_peaks)} cortes na 2ª passada", flush=True)
+
+        # Combina picos das duas passadas
+        all_peak_times = sorted(set(peak_times_sorted + extra_cuts))
+        print(f"[DETECT] {len(all_peak_times)} picos após 2ª passada", flush=True)
+
+        if len(all_peak_times) == 0:
+            print("[DETECT] Fallback: 3.5 min por faixa", flush=True)
             out, t = [], 210.0
             while t < total - min_track_duration:
                 out.append(round(t, 1)); t += 210.0
             return out
+
+        # Converte tempos de volta para "peaks" (índices) para o resto do código
+        peaks = np.array([int(t / 0.5) for t in all_peak_times])
 
         # ── Beat tracking para alinhar ao compasso ───────────────────────────
         tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP)
@@ -750,6 +798,33 @@ def process_job(job_id: str, input_path: str, folder: str):
 
         boundaries = [0.0] + transitions + [total_duration]
         segments   = [(boundaries[i], boundaries[i+1]) for i in range(len(boundaries)-1)]
+
+        # ── Funde segmentos curtos (< 2min) com o vizinho ───────────────────
+        # Pedaços de ~1 min geralmente são intros, outros ou restos de transição,
+        # não músicas completas. Funde com o segmento adjacente mais curto.
+        MIN_SEG = 120.0
+        merged = True
+        while merged and len(segments) > 1:
+            merged = False
+            for i, (s, e) in enumerate(segments):
+                if e - s < MIN_SEG:
+                    # Decide fundir com anterior ou próximo (o mais curto dos dois)
+                    if i == 0:
+                        segments[i+1] = (segments[i][0], segments[i+1][1])
+                    elif i == len(segments) - 1:
+                        segments[i-1] = (segments[i-1][0], segments[i][1])
+                    else:
+                        prev_dur = segments[i-1][1] - segments[i-1][0]
+                        next_dur = segments[i+1][1] - segments[i+1][0]
+                        if prev_dur <= next_dur:
+                            segments[i-1] = (segments[i-1][0], segments[i][1])
+                        else:
+                            segments[i+1] = (segments[i][0], segments[i+1][1])
+                    segments.pop(i)
+                    merged = True
+                    break
+        print(f"[JOB] {len(segments)} segmentos após fundir curtos", flush=True)
+
         tracks     = []
 
         for i, (raw_start, raw_end) in enumerate(segments):
