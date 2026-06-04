@@ -193,6 +193,28 @@ def _bandpass_energy(y: np.ndarray, sr: int, hop: int,
     energy = stft[bins, :].mean(axis=0).astype(float)
     return uniform_filter1d(energy, size=8)
 
+def _multiband_energy(y: np.ndarray, sr: int, hop: int, bands: list) -> list:
+    """
+    Calcula a energia de VÁRIAS bandas com UM ÚNICO STFT (economiza memória/CPU).
+    Essencial para sets longos — evita recalcular o STFT por banda.
+    bands: lista de tuplas (fmin, fmax). Retorna lista de arrays na mesma ordem.
+    """
+    import librosa
+    from scipy.ndimage import uniform_filter1d
+    n_fft = 2048
+    stft  = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    results = []
+    for fmin, fmax in bands:
+        bins = np.where((freqs >= fmin) & (freqs <= fmax))[0]
+        if len(bins) == 0:
+            results.append(np.zeros(stft.shape[1]))
+        else:
+            energy = stft[bins, :].mean(axis=0).astype(float)
+            results.append(uniform_filter1d(energy, size=8))
+    del stft  # libera o STFT imediatamente
+    return results
+
 def _normalize(x: np.ndarray, smooth: int = 10) -> np.ndarray:
     from scipy.ndimage import uniform_filter1d
     x = uniform_filter1d(x.astype(float), size=smooth)
@@ -220,33 +242,63 @@ def _get_duration(path: str) -> float:
 # O score final é a combinação das 4 camadas com pesos específicos para DJ sets.
 # ══════════════════════════════════════════════════════════════════════════════
 def detect_transitions(audio_path: str, min_track_duration: float = 60.0) -> list[float]:
+    import tempfile
+    tmp_wav = None
     try:
         import librosa
+        import gc
         from scipy.ndimage import uniform_filter1d
         from scipy.signal import find_peaks
 
-        SR  = 22050
+        # SR baixo (11025) para economizar memória em sets longos de 2-3h.
+        # Suficiente para detectar transições (mudanças de baixa/média frequência).
+        SR  = 11025
         HOP = int(SR * 0.5)   # 1 frame = 0.5s
 
-        print(f"[DETECT] Carregando áudio...")
-        y, sr = _load_audio(audio_path, sr=SR)
+        # PRÉ-CONVERSÃO com ffmpeg: converte para WAV mono no SR alvo ANTES de
+        # carregar no librosa. O ffmpeg processa em streaming (memória constante),
+        # evitando o pico de RAM que o librosa.load causa ao resamplear 3h de áudio.
+        tmp_wav = tempfile.mktemp(suffix=".wav")
+        print(f"[DETECT] Pré-convertendo com ffmpeg (SR={SR} mono)...", flush=True)
+        import subprocess
+        conv = subprocess.run(
+            ["ffmpeg", "-i", audio_path, "-ac", "1", "-ar", str(SR),
+             "-y", tmp_wav, "-loglevel", "error"],
+            capture_output=True, text=True, timeout=600
+        )
+        if conv.returncode != 0 or not os.path.exists(tmp_wav):
+            print(f"[DETECT] ffmpeg falhou, usando arquivo original. {conv.stderr[-200:]}", flush=True)
+            load_path = audio_path
+        else:
+            load_path = tmp_wav
+            print(f"[DETECT] Conversão OK", flush=True)
+
+        print(f"[DETECT] Carregando áudio (SR={SR})...", flush=True)
+        # Como já está no SR certo e mono, o load é direto (sem resample pesado)
+        y, sr = librosa.load(load_path, sr=SR, mono=True, res_type="kaiser_fast")
         total = len(y) / sr
-        print(f"[DETECT] Duração: {round(total/60, 1)} min")
+        print(f"[DETECT] Duração: {round(total/60, 1)} min — {len(y)} amostras", flush=True)
 
         if total < min_track_duration * 2:
             return []
 
-        # ── Camada 1: Sub-bass (60-150Hz) ────────────────────────────────────
-        bass = _bandpass_energy(y, sr, HOP, 60, 150)
-
-        # ── Camada 2: Midrange (200-2000Hz) ──────────────────────────────────
-        mid  = _bandpass_energy(y, sr, HOP, 200, 2000)
-
-        # ── Camada 3: High (4k-16kHz) ────────────────────────────────────────
-        high = _bandpass_energy(y, sr, HOP, 4000, 16000)
+        # ── Camadas 1-3: Bass, Mid, High com UM ÚNICO STFT (economia de RAM) ─
+        bass, mid, high = _multiband_energy(y, sr, HOP, [
+            (60, 150),      # sub-bass
+            (200, 2000),    # midrange
+            (3000, 5000),   # high (limitado pelo Nyquist de 5512Hz)
+        ])
+        print(f"[DETECT] Bandas (bass/mid/high) OK", flush=True)
 
         # ── Camada 4: MFCC tímbrico (13 coeficientes) ────────────────────────
         mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=HOP, n_mfcc=13)
+        print(f"[DETECT] MFCC OK", flush=True)
+
+        # Libera o array de áudio bruto — não é mais necessário para as features
+        # (só o beat tracking usa, e fazemos isso já já)
+        # Mantém uma cópia leve só para beat tracking
+        y_for_beats = y
+        gc.collect()
 
         n = min(len(bass), len(mid), len(high), mfcc.shape[1])
         bass = _normalize(bass[:n])
@@ -362,6 +414,11 @@ def detect_transitions(audio_path: str, min_track_duration: float = 60.0) -> lis
             return out
         except:
             return []
+    finally:
+        # Remove o WAV temporário da pré-conversão
+        if tmp_wav and os.path.exists(tmp_wav):
+            try: os.remove(tmp_wav)
+            except: pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -600,6 +657,7 @@ def process_job(job_id: str, input_path: str, folder: str):
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 2,
                          "stage": "Iniciando análise espectral..."})
 
+        print(f"[JOB] Lendo duração de {input_path}...", flush=True)
         total_duration = _get_duration(input_path)
         if total_duration == 0:
             raise Exception("Não foi possível determinar a duração do arquivo")
