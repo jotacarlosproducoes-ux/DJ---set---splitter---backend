@@ -938,6 +938,31 @@ def get_status(job_id: str):
     if not data: return {"error": "Job nao encontrado"}
     return data
 
+@app.get("/preview/{job_id}/{track_id}")
+async def preview_track(job_id: str, track_id: str, format: str = "mp3", v: str = ""):
+    """
+    Serve o áudio de uma faixa para tocar no player do navegador.
+    O parâmetro 'v' (version) é ignorado no servidor mas força o navegador
+    a buscar a versão nova após um corte (cache-busting).
+    """
+    base_filename = track_id if track_id.endswith(".mp3") else track_id + ".mp3"
+    mp3_path      = f"outputs/{job_id}/{base_filename}"
+    r2_key        = f"{job_id}/{base_filename}"
+
+    if not os.path.exists(mp3_path):
+        if not download_from_r2(r2_key, mp3_path):
+            return Response(content='{"error":"Faixa nao encontrada"}',
+                            status_code=404, media_type="application/json")
+
+    # no-cache para o navegador sempre pegar a versão atual
+    return FileResponse(mp3_path, media_type="audio/mpeg", headers={
+        "Content-Length": str(os.path.getsize(mp3_path)),
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+    })
+
+
 @app.get("/download/{job_id}/{filename}")
 async def download_track(job_id: str, filename: str, format: str = "stream"):
     base_filename = filename if filename.endswith(".mp3") else filename + ".mp3"
@@ -1009,61 +1034,76 @@ class TrimRequest(BaseModel):
 @app.post("/trim/{job_id}/{track_id}")
 async def apply_manual_trim(job_id: str, track_id: str, req: TrimRequest):
     """
-    Reaplicar o corte de uma faixa com os offsets ajustados pelo usuário.
-    Regera o MP3 com os novos pontos de início e fim.
+    Aplica o corte ajustado pelo usuário SEM destruir o arquivo original.
+    Mantém sempre um 'master' intocado e gera a versão cortada a partir dele,
+    para que o usuário possa reajustar quantas vezes quiser.
     """
-    fname      = f"{track_id}.mp3"
-    track_path = f"outputs/{job_id}/{fname}"
-    r2_key     = f"{job_id}/{fname}"
+    fname       = f"{track_id}.mp3"
+    track_path  = f"outputs/{job_id}/{fname}"
+    master_path = f"outputs/{job_id}/{track_id}_master.mp3"  # original intocado
+    r2_key      = f"{job_id}/{fname}"
+    master_key  = f"{job_id}/{track_id}_master.mp3"
 
-    # Baixa do R2 se não estiver local
+    # Garante que temos o arquivo atual localmente
     if not os.path.exists(track_path):
         if not download_from_r2(r2_key, track_path):
             return Response(content='{"error":"Faixa nao encontrada"}',
                             status_code=404, media_type="application/json")
 
-    dur = _get_duration(track_path)
+    # Na PRIMEIRA vez que cortamos, salva uma cópia master do original.
+    # Nas próximas, sempre cortamos a partir do master (nunca do já-cortado).
+    if not os.path.exists(master_path):
+        if not download_from_r2(master_key, master_path):
+            # master ainda não existe → cria a partir do arquivo atual
+            shutil.copy(track_path, master_path)
+            upload_to_r2(master_path, master_key)
+            print(f"[TRIM] Master criado para {track_id}", flush=True)
+
+    # A duração de referência é SEMPRE a do master
+    dur = _get_duration(master_path)
     if dur == 0:
         return Response(content='{"error":"Nao foi possivel ler a duracao"}',
                         status_code=400, media_type="application/json")
 
-    t_start = clamp_val(req.trim_start, 0.0, dur - 1.0)
+    t_start = clamp_val(req.trim_start, 0.0, max(0.0, dur - 1.0))
     t_end   = clamp_val(req.trim_end,   t_start + 1.0, dur)
     t_dur   = t_end - t_start
 
-    if t_dur < 10:
-        return Response(content='{"error":"Duracao muito curta (minimo 10s)"}',
+    if t_dur < 5:
+        return Response(content='{"error":"Duracao muito curta (minimo 5s)"}',
                         status_code=400, media_type="application/json")
 
-    # Gera arquivo trimado
-    trimmed_path = track_path.replace(".mp3", "_trimmed.mp3")
+    # Gera a versão cortada A PARTIR DO MASTER (não do arquivo atual)
+    trimmed_path = f"outputs/{job_id}/{track_id}_trimmed.mp3"
     ret = os.system(
-        f'ffmpeg -ss {t_start} -t {t_dur} -i "{track_path}" '
+        f'ffmpeg -ss {t_start} -t {t_dur} -i "{master_path}" '
         f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{trimmed_path}" -loglevel quiet'
     )
     if ret != 0 or not os.path.exists(trimmed_path):
         return Response(content='{"error":"Falha ao aplicar trim"}',
                         status_code=500, media_type="application/json")
 
-    # Substitui o arquivo original pelo trimado
+    # Substitui o arquivo servido pela versão cortada
     shutil.move(trimmed_path, track_path)
-
-    # Re-upload para R2
     upload_to_r2(track_path, r2_key)
 
-    # Atualiza o job com nova duração
+    # version: timestamp para o frontend quebrar o cache do player/download
+    version = int(time.time())
+
+    # Atualiza o job
     data = job_get(job_id)
     if data:
         for t in data.get("tracks", []):
             if t.get("id") == track_id:
-                t["duration"]   = round(t_dur, 1)
-                t["trimStart"]  = t_start
-                t["trimEnd"]    = t_end
+                t["duration"]  = round(t_dur, 1)
+                t["trimStart"] = t_start
+                t["trimEnd"]   = t_end
+                t["version"]   = version
         job_set(job_id, data)
 
-    print(f"[TRIM] Manual: {track_id} → {round(t_start,1)}s–{round(t_end,1)}s ({round(t_dur,1)}s)")
+    print(f"[TRIM] {track_id}: {round(t_start,1)}s–{round(t_end,1)}s = {round(t_dur,1)}s (v{version})", flush=True)
     return {"status": "ok", "duration": round(t_dur, 1),
-            "trim_start": t_start, "trim_end": t_end}
+            "trim_start": t_start, "trim_end": t_end, "version": version}
 
 
 def clamp_val(v: float, mn: float, mx: float) -> float:
