@@ -651,6 +651,71 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
 # ══════════════════════════════════════════════════════════════════════════════
 # PIPELINE PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
+def merge_false_splits(input_path: str, transitions: list, total_duration: float) -> list:
+    """
+    Remove cortes falsos: quando uma música tem um breakdown longo, o detector
+    pode marcar uma transição no meio dela. Para cada transição, identifica um
+    trecho ANTES e um trecho DEPOIS. Se forem a mesma música (mesmo artista+título),
+    o corte é falso e é removido.
+
+    Para economizar chamadas de API, só verifica transições onde os segmentos
+    vizinhos são curtos (< 4 min) — músicas longas e bem separadas não precisam.
+    """
+    import tempfile
+    if not transitions:
+        return transitions
+
+    boundaries = [0.0] + transitions + [total_duration]
+    keep = []  # transições que vamos manter
+
+    for idx, t in enumerate(transitions):
+        seg_before_start = boundaries[idx]
+        seg_after_end    = boundaries[idx + 2]
+
+        dur_before = t - seg_before_start
+        dur_after  = seg_after_end - t
+
+        # Se ambos os lados são longos (> 4 min), provavelmente são músicas
+        # diferentes de verdade — não gasta API verificando.
+        if dur_before > 240 and dur_after > 240:
+            keep.append(t)
+            continue
+
+        # Identifica um trecho de cada lado da transição (20s a 15s da borda)
+        def sample_id(center: float) -> dict:
+            tmp = tempfile.mktemp(suffix=".mp3")
+            start = max(0.0, center - 10)
+            os.system(f'ffmpeg -ss {start} -t 20 -i "{input_path}" '
+                      f'-vn -acodec mp3 -ab 128k -y "{tmp}" -loglevel quiet')
+            try:
+                info = identify_song(tmp, center)
+            finally:
+                if os.path.exists(tmp): os.remove(tmp)
+            return info
+
+        # Trecho 25s ANTES da transição e 25s DEPOIS
+        before = sample_id(max(seg_before_start + 5, t - 25))
+        after  = sample_id(min(seg_after_end - 5, t + 25))
+
+        same = (
+            before["artist"] != "Desconhecido" and
+            before["artist"].lower() == after["artist"].lower() and
+            before["title"].lower()  == after["title"].lower()
+        )
+
+        if same:
+            print(f"[MERGE] Corte falso @ {round(t/60,1)}min — "
+                  f"mesma música nos dois lados ({before['artist']} - {before['title']}). Removendo.", flush=True)
+            # NÃO adiciona t em keep → o corte some, fundindo os segmentos
+        else:
+            keep.append(t)
+
+    removed = len(transitions) - len(keep)
+    if removed > 0:
+        print(f"[MERGE] {removed} corte(s) falso(s) removido(s)", flush=True)
+    return keep
+
+
 def process_job(job_id: str, input_path: str, folder: str):
     print(f"[JOB] >>> process_job INICIADO para {job_id}", flush=True)
     try:
@@ -669,6 +734,16 @@ def process_job(job_id: str, input_path: str, folder: str):
 
         transitions = detect_transitions(input_path, min_track_duration=60.0)
         print(f"[JOB] {len(transitions)} transições → {len(transitions)+1} faixas")
+
+        # ── Etapa 1.5: Funde falsos cortes (mesma música cortada em pedaços) ──
+        # Um breakdown longo (bass some e volta) pode gerar um corte falso no
+        # meio de uma música. Identificamos cada lado da transição e, se for a
+        # mesma faixa, removemos o corte.
+        if len(transitions) > 0:
+            job_set(job_id, {"status": "processing", "tracks": [], "progress": 28,
+                             "stage": "Verificando cortes falsos (breakdowns)..."})
+            transitions = merge_false_splits(input_path, transitions, total_duration)
+            print(f"[JOB] Após fusão: {len(transitions)} transições → {len(transitions)+1} faixas", flush=True)
 
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 35,
                          "stage": f"{len(transitions)} transições detectadas. Aplicando trim cirúrgico..."})
