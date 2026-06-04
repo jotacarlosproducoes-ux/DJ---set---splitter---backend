@@ -6,6 +6,20 @@ import numpy as np
 import boto3
 from botocore.config import Config
 from pydantic import BaseModel
+from concurrent.futures import ThreadPoolExecutor
+
+# Pool de threads para o processamento pesado.
+# librosa, numpy, scipy e ffmpeg liberam o GIL durante operações pesadas,
+# então uma thread separada permite que o servidor web continue respondendo
+# ao health check do Render (evitando reinício do container no meio do job).
+# max_workers=2 → até 2 sets processando ao mesmo tempo.
+_THREAD_POOL = None
+
+def get_pool() -> ThreadPoolExecutor:
+    global _THREAD_POOL
+    if _THREAD_POOL is None:
+        _THREAD_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="processor")
+    return _THREAD_POOL
 
 app = FastAPI()
 
@@ -743,7 +757,8 @@ async def upload_chunk(background_tasks: BackgroundTasks,
     shutil.rmtree(chunks_folder, ignore_errors=True)
     job_set(job_id, {"status": "processing", "tracks": [], "progress": 0,
                      "stage": "Arquivo recebido, iniciando análise..."})
-    background_tasks.add_task(process_job, job_id, input_path, folder)
+    # Roda em processo separado para não bloquear o servidor web
+    get_pool().submit(process_job, job_id, input_path, folder)
     return {"status": "done", "job_id": job_id}
 
 @app.post("/split")
@@ -755,7 +770,7 @@ async def split_audio(background_tasks: BackgroundTasks, file: UploadFile = File
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
     job_set(job_id, {"status": "processing", "tracks": [], "progress": 0})
-    background_tasks.add_task(process_job, job_id, input_path, folder)
+    get_pool().submit(process_job, job_id, input_path, folder)
     return {"job_id": job_id, "status": "processing"}
 
 
@@ -779,11 +794,15 @@ def download_and_process(job_id: str, url: str, folder: str):
 
         # yt-dlp: baixa melhor áudio e converte para MP3
         # Funciona com YouTube E SoundCloud (mesma ferramenta)
+        # -N 8: baixa 8 fragmentos em paralelo (SoundCloud usa HLS fragmentado,
+        #       sem isso o download fica lento — ETA de 12+ min vira ~2 min)
         cmd = (
             f'yt-dlp {cookies_arg} '
             f'-f "bestaudio/best" '
+            f'-N 8 '
             f'--extract-audio --audio-format mp3 --audio-quality 0 '
             f'--no-playlist '
+            f'--no-warnings '
             f'-o "{folder}/input.%(ext)s" '
             f'"{url}"'
         )
@@ -838,7 +857,7 @@ async def split_from_url(background_tasks: BackgroundTasks, req: URLRequest):
 
     job_set(job_id, {"status": "processing", "tracks": [], "progress": 0,
                      "stage": "Iniciando download da URL..."})
-    background_tasks.add_task(download_and_process, job_id, url, folder)
+    get_pool().submit(download_and_process, job_id, url, folder)
 
     print(f"[URL] Job {job_id} iniciado para {url}")
     return {"job_id": job_id, "status": "processing"}
