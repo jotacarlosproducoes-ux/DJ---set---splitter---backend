@@ -1107,61 +1107,70 @@ def get_status(job_id: str):
 @app.get("/waveform/{job_id}")
 def get_waveform(job_id: str, points: int = 2000):
     """
-    Gera os dados da waveform do SET INTEIRO de forma leve.
-    Retorna uma lista de ~2000 valores (0 a 1) representando a amplitude ao
-    longo do set, mais a duração total e os pontos de corte das faixas.
-    O frontend usa isso para desenhar o espectro completo sem carregar o
-    áudio inteiro (rápido e leve, funciona até no celular).
+    Gera os dados da waveform do SET INTEIRO de forma leve e robusta.
+    Usa ffmpeg para extrair amostras PCM em baixa taxa (mais confiável que
+    librosa para arquivos grandes). Retorna ~2000 valores 0-1.
     """
-    import tempfile
+    import subprocess
     input_path = f"outputs/{job_id}/input.mp3"
 
-    # Se o input não está local, tenta baixar do R2
+    # Garante o input local (baixa do R2 se preciso)
     if not os.path.exists(input_path):
+        print(f"[WAVEFORM] input não local, tentando R2: {job_id}", flush=True)
         if not download_from_r2(f"{job_id}/input.mp3", input_path):
-            # Sem o input original, retorna só os cortes salvos
             data = job_get(job_id) or {}
             tracks = data.get("tracks", [])
-            return {
-                "peaks": [],
-                "duration": 0,
-                "cuts": [t.get("timestamp", 0) for t in tracks],
-                "error": "audio_indisponivel"
-            }
+            print(f"[WAVEFORM] input indisponível para {job_id}", flush=True)
+            return {"peaks": [], "duration": 0,
+                    "cuts": [t.get("timestamp", 0) for t in tracks],
+                    "error": "audio_indisponivel"}
 
     try:
-        import librosa
-        # Carrega em baixíssima resolução — só pra forma de onda
-        y, sr = librosa.load(input_path, sr=4000, mono=True, res_type="kaiser_fast")
-        total = len(y) / sr
+        # Duração via ffprobe
+        total = _get_duration(input_path)
+        print(f"[WAVEFORM] {job_id}: duração {round(total,1)}s, gerando peaks...", flush=True)
 
-        # Divide em 'points' blocos e pega o pico (RMS) de cada bloco
+        # Extrai PCM mono 4000Hz, 8-bit unsigned, via ffmpeg (rápido, baixa RAM)
+        SR = 4000
+        proc = subprocess.run(
+            ["ffmpeg", "-i", input_path, "-ac", "1", "-ar", str(SR),
+             "-f", "u8", "-"],
+            capture_output=True, timeout=300
+        )
+        raw = proc.stdout
+        if not raw:
+            print(f"[WAVEFORM] ffmpeg não retornou áudio. stderr: {proc.stderr[-300:]}", flush=True)
+            return {"peaks": [], "duration": round(total, 2), "cuts": [], "error": "sem_audio"}
+
+        # Converte bytes (0-255) para array, centra em 0 (-128) e tira valor absoluto
+        samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0
+        samples = np.abs(samples)
+
         points = max(500, min(points, 5000))
-        block = max(1, len(y) // points)
+        block = max(1, len(samples) // points)
         peaks = []
-        for i in range(0, len(y), block):
-            seg = y[i:i+block]
+        for i in range(0, len(samples), block):
+            seg = samples[i:i+block]
             if len(seg) > 0:
-                peaks.append(round(float(np.sqrt(np.mean(seg**2))), 4))
-        # Normaliza 0-1
+                peaks.append(float(seg.mean()))
+
         mx = max(peaks) if peaks else 1.0
         if mx > 0:
             peaks = [round(p / mx, 4) for p in peaks]
 
-        # Pega os pontos de corte das faixas já processadas
         data = job_get(job_id) or {}
         tracks = data.get("tracks", [])
         cuts = [t.get("timestamp", 0) for t in tracks]
 
-        return {
-            "peaks": peaks,
-            "duration": round(total, 2),
-            "cuts": cuts,
-            "points": len(peaks)
-        }
+        print(f"[WAVEFORM] {job_id}: {len(peaks)} peaks gerados OK", flush=True)
+        return {"peaks": peaks, "duration": round(total, 2),
+                "cuts": cuts, "points": len(peaks)}
+
     except Exception as e:
         print(f"[WAVEFORM] Erro: {e}", flush=True)
+        import traceback; traceback.print_exc()
         return {"peaks": [], "duration": 0, "cuts": [], "error": str(e)}
+
 
 
 @app.get("/preview/{job_id}/{track_id}")
