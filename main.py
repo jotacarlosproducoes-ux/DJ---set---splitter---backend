@@ -701,35 +701,40 @@ def extend_track(input_mp3: str, output_mp3: str, target_extra_seconds: int = 60
 # ══════════════════════════════════════════════════════════════════════════════
 def merge_false_splits(input_path: str, transitions: list, total_duration: float) -> list:
     """
-    Remove cortes falsos: quando uma música tem um breakdown longo, o detector
-    pode marcar uma transição no meio dela. Para cada transição, identifica um
-    trecho ANTES e um trecho DEPOIS. Se forem a mesma música (mesmo artista+título),
-    o corte é falso e é removido.
+    Remove APENAS cortes claramente falsos. Um corte falso típico de breakdown
+    gera um segmento MUITO curto (< 75s) cercado pela mesma música.
 
-    Para economizar chamadas de API, só verifica transições onde os segmentos
-    vizinhos são curtos (< 4 min) — músicas longas e bem separadas não precisam.
+    IMPORTANTE: esta função é deliberadamente CONSERVADORA. É melhor deixar um
+    corte falso passar (o usuário ajusta no editor) do que fundir músicas
+    diferentes (que destrói o resultado). A identificação por API é pouco
+    confiável, então NÃO confiamos nela como critério principal.
+
+    Critério para fundir (remover o corte): o segmento entre dois cortes é
+    muito curto (< 75s) E os dois lados são identificados com o MESMO nome
+    conhecido (não "Desconhecido"). Se qualquer lado for longo, NÃO funde.
     """
     import tempfile
-    if not transitions:
+    if not transitions or len(transitions) < 2:
         return transitions
 
     boundaries = [0.0] + transitions + [total_duration]
-    keep = []  # transições que vamos manter
+    keep = []
 
     for idx, t in enumerate(transitions):
         seg_before_start = boundaries[idx]
         seg_after_end    = boundaries[idx + 2]
-
         dur_before = t - seg_before_start
         dur_after  = seg_after_end - t
 
-        # Se ambos os lados são longos (> 4 min), provavelmente são músicas
-        # diferentes de verdade — não gasta API verificando.
-        if dur_before > 240 and dur_after > 240:
+        # Só considera fundir se ALGUM lado for muito curto (< 75s).
+        # Cortes entre dois segmentos de tamanho normal são quase sempre reais.
+        menor_lado = min(dur_before, dur_after)
+        if menor_lado >= 75:
             keep.append(t)
             continue
 
-        # Identifica um trecho de cada lado da transição (20s a 15s da borda)
+        # Mesmo com um lado curto, só funde se a identificação CONFIRMAR
+        # que é a mesma música conhecida nos dois lados.
         def sample_id(center: float) -> dict:
             tmp = tempfile.mktemp(suffix=".mp3")
             start = max(0.0, center - 10)
@@ -741,26 +746,27 @@ def merge_false_splits(input_path: str, transitions: list, total_duration: float
                 if os.path.exists(tmp): os.remove(tmp)
             return info
 
-        # Trecho 25s ANTES da transição e 25s DEPOIS
-        before = sample_id(max(seg_before_start + 5, t - 25))
-        after  = sample_id(min(seg_after_end - 5, t + 25))
+        before = sample_id(max(seg_before_start + 5, t - 20))
+        after  = sample_id(min(seg_after_end - 5, t + 20))
 
+        # Funde SÓ se: ambos conhecidos (não Desconhecido) E nome idêntico.
+        # "Desconhecido" nos dois lados NÃO funde (não temos como confirmar).
         same = (
             before["artist"] != "Desconhecido" and
+            after["artist"]  != "Desconhecido" and
             before["artist"].lower() == after["artist"].lower() and
             before["title"].lower()  == after["title"].lower()
         )
 
         if same:
-            print(f"[MERGE] Corte falso @ {round(t/60,1)}min — "
-                  f"mesma música nos dois lados ({before['artist']} - {before['title']}). Removendo.", flush=True)
-            # NÃO adiciona t em keep → o corte some, fundindo os segmentos
+            print(f"[MERGE] Corte falso @ {round(t/60,1)}min (lado curto {round(menor_lado)}s, "
+                  f"mesma música: {before['artist']} - {before['title']}). Removendo.", flush=True)
         else:
             keep.append(t)
 
     removed = len(transitions) - len(keep)
-    if removed > 0:
-        print(f"[MERGE] {removed} corte(s) falso(s) removido(s)", flush=True)
+    print(f"[MERGE] {removed} corte(s) falso(s) removido(s) de {len(transitions)} — "
+          f"{len(keep)} mantidos", flush=True)
     return keep
 
 
@@ -802,7 +808,7 @@ def process_job(job_id: str, input_path: str, folder: str):
         # ── Funde segmentos curtos (< 2min) com o vizinho ───────────────────
         # Pedaços de ~1 min geralmente são intros, outros ou restos de transição,
         # não músicas completas. Funde com o segmento adjacente mais curto.
-        MIN_SEG = 120.0
+        MIN_SEG = 75.0
         merged = True
         while merged and len(segments) > 1:
             merged = False
