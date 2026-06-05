@@ -1104,6 +1104,26 @@ def get_status(job_id: str):
     return data
 
 
+@app.get("/full-audio/{job_id}")
+def get_full_audio(job_id: str):
+    """
+    Serve o áudio ORIGINAL completo do set (input.mp3) para o player do
+    editor de set inteiro tocar continuamente a partir de qualquer ponto.
+    Suporta streaming/seek via Accept-Ranges.
+    """
+    input_path = f"outputs/{job_id}/input.mp3"
+    if not os.path.exists(input_path):
+        if not download_from_r2(f"{job_id}/input.mp3", input_path):
+            return Response(content='{"error":"audio nao encontrado"}',
+                            status_code=404, media_type="application/json")
+    return FileResponse(input_path, media_type="audio/mpeg", headers={
+        "Content-Length": str(os.path.getsize(input_path)),
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",
+    })
+
+
 @app.get("/waveform/{job_id}")
 def get_waveform(job_id: str, points: int = 2000):
     """
