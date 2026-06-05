@@ -784,6 +784,13 @@ def process_job(job_id: str, input_path: str, folder: str):
             raise Exception("Não foi possível determinar a duração do arquivo")
         print(f"[JOB] Duração total: {round(total_duration/60, 1)} min", flush=True)
 
+        # Sobe o input original pro R2 — necessário para gerar a waveform do
+        # set inteiro depois (mesmo se o Render reiniciar e limpar arquivos locais)
+        try:
+            upload_to_r2(input_path, f"{job_id}/input.mp3")
+        except Exception as e:
+            print(f"[JOB] Aviso: não consegui subir input pro R2: {e}", flush=True)
+
         # ── Etapa 1: Detecção de transições ──────────────────────────────────
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
                          "stage": "Analisando espectro — Bass + MFCC + Timbre (1-3 min)..."})
@@ -1095,6 +1102,67 @@ def get_status(job_id: str):
     data = job_get(job_id)
     if not data: return {"error": "Job nao encontrado"}
     return data
+
+
+@app.get("/waveform/{job_id}")
+def get_waveform(job_id: str, points: int = 2000):
+    """
+    Gera os dados da waveform do SET INTEIRO de forma leve.
+    Retorna uma lista de ~2000 valores (0 a 1) representando a amplitude ao
+    longo do set, mais a duração total e os pontos de corte das faixas.
+    O frontend usa isso para desenhar o espectro completo sem carregar o
+    áudio inteiro (rápido e leve, funciona até no celular).
+    """
+    import tempfile
+    input_path = f"outputs/{job_id}/input.mp3"
+
+    # Se o input não está local, tenta baixar do R2
+    if not os.path.exists(input_path):
+        if not download_from_r2(f"{job_id}/input.mp3", input_path):
+            # Sem o input original, retorna só os cortes salvos
+            data = job_get(job_id) or {}
+            tracks = data.get("tracks", [])
+            return {
+                "peaks": [],
+                "duration": 0,
+                "cuts": [t.get("timestamp", 0) for t in tracks],
+                "error": "audio_indisponivel"
+            }
+
+    try:
+        import librosa
+        # Carrega em baixíssima resolução — só pra forma de onda
+        y, sr = librosa.load(input_path, sr=4000, mono=True, res_type="kaiser_fast")
+        total = len(y) / sr
+
+        # Divide em 'points' blocos e pega o pico (RMS) de cada bloco
+        points = max(500, min(points, 5000))
+        block = max(1, len(y) // points)
+        peaks = []
+        for i in range(0, len(y), block):
+            seg = y[i:i+block]
+            if len(seg) > 0:
+                peaks.append(round(float(np.sqrt(np.mean(seg**2))), 4))
+        # Normaliza 0-1
+        mx = max(peaks) if peaks else 1.0
+        if mx > 0:
+            peaks = [round(p / mx, 4) for p in peaks]
+
+        # Pega os pontos de corte das faixas já processadas
+        data = job_get(job_id) or {}
+        tracks = data.get("tracks", [])
+        cuts = [t.get("timestamp", 0) for t in tracks]
+
+        return {
+            "peaks": peaks,
+            "duration": round(total, 2),
+            "cuts": cuts,
+            "points": len(peaks)
+        }
+    except Exception as e:
+        print(f"[WAVEFORM] Erro: {e}", flush=True)
+        return {"peaks": [], "duration": 0, "cuts": [], "error": str(e)}
+
 
 @app.get("/preview/{job_id}/{track_id}")
 async def preview_track(job_id: str, track_id: str, format: str = "mp3", v: str = ""):
