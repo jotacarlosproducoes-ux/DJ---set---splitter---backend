@@ -241,7 +241,7 @@ def _get_duration(path: str) -> float:
 #
 # O score final é a combinação das 4 camadas com pesos específicos para DJ sets.
 # ══════════════════════════════════════════════════════════════════════════════
-def detect_transitions(audio_path: str, min_track_duration: float = 60.0) -> list[float]:
+def detect_transitions(audio_path: str, min_track_duration: float = 100.0) -> list[float]:
     import tempfile
     tmp_wav = None
     try:
@@ -341,7 +341,7 @@ def detect_transitions(audio_path: str, min_track_duration: float = 60.0) -> lis
         min_dist  = int(min_track_duration / 0.5)
         print(f"[DETECT] Threshold: {round(threshold, 3)}", flush=True)
 
-        peaks, _ = find_peaks(score, height=threshold, distance=min_dist, prominence=0.07)
+        peaks, _ = find_peaks(score, height=threshold, distance=min_dist, prominence=0.12)
 
         # Segunda tentativa com threshold menor se necessário
         if len(peaks) == 0:
@@ -356,7 +356,7 @@ def detect_transitions(audio_path: str, min_track_duration: float = 60.0) -> lis
         # Se ficou algum trecho > 7min sem corte, provavelmente há músicas
         # grudadas lá (transições suaves que o threshold global perdeu).
         # Roda uma detecção LOCAL mais sensível só nesse trecho.
-        MAX_GAP_SEC = 420  # 7 minutos
+        MAX_GAP_SEC = 600  # 10 minutos (só trechos realmente longos)
         peak_times_sorted = sorted([float(frame_times[min(int(p), n-1)]) for p in peaks])
         gap_edges = [0.0] + peak_times_sorted + [total]
         extra_cuts = []
@@ -375,12 +375,14 @@ def detect_transitions(audio_path: str, min_track_duration: float = 60.0) -> lis
                 continue
 
             local_score = score[f0:f1]
-            local_thresh = float(np.percentile(local_score, 60))
+            # Threshold local exigente (percentil 75) — só pega transições
+            # claras dentro do gap, não qualquer variação (evita picotar música)
+            local_thresh = float(np.percentile(local_score, 75))
             local_peaks, _ = find_peaks(
                 local_score,
                 height=local_thresh,
                 distance=min_dist,
-                prominence=0.05
+                prominence=0.12  # exige pico bem definido
             )
             for lp in local_peaks:
                 t_local = float(frame_times[min(f0 + int(lp), n - 1)])
@@ -786,7 +788,7 @@ def process_job(job_id: str, input_path: str, folder: str):
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
                          "stage": "Analisando espectro — Bass + MFCC + Timbre (1-3 min)..."})
 
-        transitions = detect_transitions(input_path, min_track_duration=60.0)
+        transitions = detect_transitions(input_path, min_track_duration=100.0)
         print(f"[JOB] {len(transitions)} transições → {len(transitions)+1} faixas")
 
         # ── Etapa 1.5: Funde falsos cortes (mesma música cortada em pedaços) ──
