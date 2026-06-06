@@ -1363,3 +1363,111 @@ async def apply_manual_trim(job_id: str, track_id: str, req: TrimRequest):
 
 def clamp_val(v: float, mn: float, mx: float) -> float:
     return max(mn, min(mx, v))
+
+
+class RecutRequest(BaseModel):
+    cut_points: list[float]   # lista de pontos de corte em segundos (ordenados)
+
+
+@app.post("/recut/{job_id}")
+def recut_set(job_id: str, req: RecutRequest):
+    """
+    Recorta o SET INTEIRO usando os pontos de corte definidos manualmente
+    pelo usuário no editor do espectro. Gera faixas novas a partir do
+    input.mp3 original e substitui a lista de faixas do job.
+
+    cut_points: lista de tempos (segundos) onde cada faixa COMEÇA, incluindo
+    ou não o 0. Ex: [0, 180, 420, ...]. As faixas vão de um ponto ao próximo.
+    """
+    import threading
+    input_path = f"outputs/{job_id}/input.mp3"
+    if not os.path.exists(input_path):
+        if not download_from_r2(f"{job_id}/input.mp3", input_path):
+            return Response(content='{"error":"audio do set nao encontrado"}',
+                            status_code=404, media_type="application/json")
+
+    total = _get_duration(input_path)
+    if total <= 0:
+        return Response(content='{"error":"nao foi possivel ler o audio"}',
+                        status_code=400, media_type="application/json")
+
+    # Normaliza os pontos: ordena, remove duplicados, garante 0 no início
+    pts = sorted(set([round(float(p), 1) for p in req.cut_points if 0 <= p < total]))
+    if not pts or pts[0] > 1.0:
+        pts = [0.0] + pts
+    # Monta os limites das faixas: cada faixa vai de pts[i] a pts[i+1] (ou total)
+    bounds = pts + [total]
+
+    if len(bounds) < 2:
+        return Response(content='{"error":"pontos de corte insuficientes"}',
+                        status_code=400, media_type="application/json")
+
+    # Processa em background (recorte pode demorar) e atualiza o job
+    def do_recut():
+        try:
+            folder = f"outputs/{job_id}"
+            os.makedirs(folder, exist_ok=True)
+            new_tracks = []
+            n = len(bounds) - 1
+            job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
+                             "stage": f"Recortando em {n} faixas..."})
+
+            for i in range(n):
+                seg_start = bounds[i]
+                seg_end   = bounds[i + 1]
+                seg_dur   = seg_end - seg_start
+                if seg_dur < 5:
+                    continue
+
+                fname = f"recut_{i:03d}.mp3"
+                out_path = f"{folder}/{fname}"
+
+                # Corta o trecho do input original
+                ret = os.system(
+                    f'ffmpeg -ss {seg_start} -t {seg_dur} -i "{input_path}" '
+                    f'-vn -acodec mp3 -ab 320k -ar 44100 -y "{out_path}" -loglevel quiet'
+                )
+                if ret != 0 or not os.path.exists(out_path):
+                    print(f"[RECUT] Falha na faixa {i}", flush=True)
+                    continue
+
+                # Identifica (para nomear)
+                try:
+                    info = identify_song(out_path, seg_start)
+                    artist = info.get("artist", "Desconhecido")
+                    title  = info.get("title", f"Faixa {int(seg_start)}s")
+                except Exception:
+                    artist, title = "Desconhecido", f"Faixa {int(seg_start)}s"
+
+                name = f"{artist} - {title}"
+                upload_to_r2(out_path, f"{job_id}/{fname}")
+
+                new_tracks.append({
+                    "id":           f"recut_{i:03d}",
+                    "name":         name,
+                    "artist":       artist,
+                    "title":        title,
+                    "timestamp":    int(seg_start),
+                    "duration":     round(seg_dur, 1),
+                    "url":          f"/download/{job_id}/{fname}",
+                    "url_mp3":      f"/download/{job_id}/{fname}?format=mp3",
+                    "url_wav":      f"/download/{job_id}/{fname}?format=wav",
+                    "url_extended": f"/download/{job_id}/{fname}?format=extended",
+                })
+
+                prog = 5 + int(90 * (i + 1) / n)
+                job_set(job_id, {"status": "processing", "tracks": new_tracks,
+                                 "progress": prog, "stage": f"✓ {name}"})
+                print(f"[RECUT] Faixa {i+1}/{n}: {round(seg_start/60,1)}min "
+                      f"({round(seg_dur,1)}s) | {name}", flush=True)
+
+            job_set(job_id, {"status": "done", "tracks": new_tracks, "progress": 100,
+                             "stage": f"Recorte concluído — {len(new_tracks)} faixas!"})
+            print(f"[RECUT] {job_id} concluído — {len(new_tracks)} faixas", flush=True)
+        except Exception as e:
+            print(f"[RECUT] Erro: {e}", flush=True)
+            import traceback; traceback.print_exc()
+            job_set(job_id, {"status": "error", "error": str(e)})
+
+    get_pool().submit(do_recut)
+    return {"status": "processing", "faixas_previstas": len(bounds) - 1}
