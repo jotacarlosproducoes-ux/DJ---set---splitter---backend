@@ -241,7 +241,8 @@ def _get_duration(path: str) -> float:
 #
 # O score final é a combinação das 4 camadas com pesos específicos para DJ sets.
 # ══════════════════════════════════════════════════════════════════════════════
-def detect_transitions(audio_path: str, min_track_duration: float = 100.0) -> list[float]:
+def detect_transitions(audio_path: str, min_track_duration: float = 100.0) -> tuple[list[float], float]:
+    """Retorna (lista de transições em segundos, BPM detectado)"""
     import tempfile
     tmp_wav = None
     try:
@@ -280,7 +281,7 @@ def detect_transitions(audio_path: str, min_track_duration: float = 100.0) -> li
         print(f"[DETECT] Duração: {round(total/60, 1)} min — {len(y)} amostras", flush=True)
 
         if total < min_track_duration * 2:
-            return []
+            return [], 0.0
 
         # ── Camadas 1-3: Bass, Mid, High com UM ÚNICO STFT (economia de RAM) ─
         bass, mid, high = _multiband_energy(y, sr, HOP, [
@@ -451,7 +452,7 @@ def detect_transitions(audio_path: str, min_track_duration: float = 100.0) -> li
                 out.append(t)
 
         print(f"[DETECT] {len(out)} transições finais: {[round(t/60,2) for t in out]} min")
-        return out
+        return out, tempo_val
 
     except Exception as e:
         print(f"[DETECT] Erro: {e}")
@@ -784,19 +785,55 @@ def process_job(job_id: str, input_path: str, folder: str):
             raise Exception("Não foi possível determinar a duração do arquivo")
         print(f"[JOB] Duração total: {round(total_duration/60, 1)} min", flush=True)
 
-        # Sobe o input original pro R2 — necessário para gerar a waveform do
-        # set inteiro depois (mesmo se o Render reiniciar e limpar arquivos locais)
+        # Sobe o input original pro R2 — necessário para gerar a waveform e
+        # tocar o set inteiro depois (mesmo se o Render reiniciar e limpar local)
         try:
-            upload_to_r2(input_path, f"{job_id}/input.mp3")
+            ok_up = upload_to_r2(input_path, f"{job_id}/input.mp3")
+            if ok_up:
+                print(f"[JOB] input.mp3 enviado ao R2 OK ({job_id})", flush=True)
+            else:
+                print(f"[JOB] FALHA ao enviar input.mp3 ao R2 ({job_id}) — upload_to_r2 retornou False", flush=True)
         except Exception as e:
-            print(f"[JOB] Aviso: não consegui subir input pro R2: {e}", flush=True)
+            print(f"[JOB] ERRO ao subir input pro R2: {e}", flush=True)
+            import traceback; traceback.print_exc()
 
         # ── Etapa 1: Detecção de transições ──────────────────────────────────
         job_set(job_id, {"status": "processing", "tracks": [], "progress": 5,
                          "stage": "Analisando espectro — Bass + MFCC + Timbre (1-3 min)..."})
 
-        transitions = detect_transitions(input_path, min_track_duration=100.0)
-        print(f"[JOB] {len(transitions)} transições → {len(transitions)+1} faixas")
+        transitions, bpm = detect_transitions(input_path, min_track_duration=100.0)
+        print(f"[JOB] {len(transitions)} transições → {len(transitions)+1} faixas | BPM: {round(bpm,1)}")
+
+        # ── Detecta tonalidade (key) ─────────────────────────────────────────
+        key_str = "Desconhecida"
+        try:
+            import librosa
+            y_key, sr_key = librosa.load(input_path, sr=11025, mono=True,
+                                          duration=120, res_type="kaiser_fast")
+            chroma = librosa.feature.chroma_cqt(y=y_key, sr=sr_key)
+            chroma_mean = chroma.mean(axis=1)
+            key_idx = int(chroma_mean.argmax())
+            NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+            # Detecta modo maior/menor via perfil de Krumhansl
+            major = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88]
+            minor = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17]
+            import numpy as np
+            scores_maj = [np.corrcoef(np.roll(major, i), chroma_mean)[0,1] for i in range(12)]
+            scores_min = [np.corrcoef(np.roll(minor, i), chroma_mean)[0,1] for i in range(12)]
+            best_maj = max(range(12), key=lambda i: scores_maj[i])
+            best_min = max(range(12), key=lambda i: scores_min[i])
+            if scores_maj[best_maj] >= scores_min[best_min]:
+                key_str = f"{NOTES[best_maj]} Major"
+            else:
+                key_str = f"{NOTES[best_min]} Minor"
+            print(f"[JOB] Tonalidade detectada: {key_str}", flush=True)
+        except Exception as e:
+            print(f"[JOB] Aviso: não detectou tonalidade: {e}", flush=True)
+
+        # Salva BPM e tonalidade no job para o frontend exibir
+        job_set(job_id, {"status": "processing", "tracks": [], "progress": 10,
+                         "stage": "Analisando transições...",
+                         "bpm": round(bpm, 1), "key": key_str})
 
         # ── Etapa 1.5: Funde falsos cortes (mesma música cortada em pedaços) ──
         # Um breakdown longo (bass some e volta) pode gerar um corte falso no
@@ -937,8 +974,9 @@ def process_job(job_id: str, input_path: str, folder: str):
                              "stage": f"✓ {name}"})
 
         job_set(job_id, {"status": "done", "tracks": tracks, "progress": 100,
-                         "stage": f"Concluído — {len(tracks)} faixas extraídas!"})
-        print(f"[JOB] {job_id} concluído — {len(tracks)} faixas")
+                         "stage": f"Concluído — {len(tracks)} faixas extraídas!",
+                         "bpm": round(bpm, 1), "key": key_str})
+        print(f"[JOB] {job_id} concluído — {len(tracks)} faixas | BPM: {round(bpm,1)} | Key: {key_str}")
 
     except Exception as e:
         print(f"[JOB] Erro fatal: {e}")
@@ -1164,27 +1202,55 @@ def get_waveform(job_id: str, points: int = 2000):
 
         # Converte bytes (0-255) para array, centra em 0 (-128) e tira valor absoluto
         samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0
-        samples = np.abs(samples)
 
         points = max(500, min(points, 5000))
         block = max(1, len(samples) // points)
-        peaks = []
-        for i in range(0, len(samples), block):
-            seg = samples[i:i+block]
-            if len(seg) > 0:
-                peaks.append(float(seg.mean()))
 
-        mx = max(peaks) if peaks else 1.0
-        if mx > 0:
-            peaks = [round(p / mx, 4) for p in peaks]
+        # Gera 3 bandas para colorização (grave=bass, médio=mid, agudo=high)
+        # Usa filtros simples via convolução de média móvel em diferentes escalas
+        # Bass: variação lenta (janela grande) | High: variação rápida (janela pequena)
+        def smooth(arr, w):
+            kernel = np.ones(w) / w
+            return np.convolve(np.abs(arr), kernel, mode='same')
+
+        bass_smooth = smooth(samples, max(1, SR * 4))   # ~4 períodos
+        mid_smooth  = smooth(samples, max(1, SR // 4))  # ~250ms
+        high_raw    = np.abs(samples - smooth(samples, max(1, SR // 8)))
+
+        peaks_r, peaks_g, peaks_b, peaks_total = [], [], [], []
+        for i in range(0, len(samples), block):
+            seg_b = bass_smooth[i:i+block]
+            seg_m = mid_smooth[i:i+block]
+            seg_h = high_raw[i:i+block]
+            seg_t = np.abs(samples[i:i+block])
+            if len(seg_t) > 0:
+                peaks_r.append(float(seg_b.mean()))
+                peaks_g.append(float(seg_m.mean()))
+                peaks_b.append(float(seg_h.mean()))
+                peaks_total.append(float(seg_t.mean()))
+
+        def norm(lst):
+            mx = max(lst) if lst else 1.0
+            if mx == 0: mx = 1.0
+            return [round(v / mx, 4) for v in lst]
+
+        peaks_r = norm(peaks_r)
+        peaks_g = norm(peaks_g)
+        peaks_b = norm(peaks_b)
+        peaks   = norm(peaks_total)  # amplitude total (compatibilidade)
 
         data = job_get(job_id) or {}
         tracks = data.get("tracks", [])
         cuts = [t.get("timestamp", 0) for t in tracks]
+        bpm = data.get("bpm", 0)
+        key = data.get("key", "")
 
-        print(f"[WAVEFORM] {job_id}: {len(peaks)} peaks gerados OK", flush=True)
-        return {"peaks": peaks, "duration": round(total, 2),
-                "cuts": cuts, "points": len(peaks)}
+        print(f"[WAVEFORM] {job_id}: {len(peaks)} peaks gerados OK (colorido)", flush=True)
+        return {"peaks": peaks,
+                "bands": {"bass": peaks_r, "mid": peaks_g, "high": peaks_b},
+                "duration": round(total, 2),
+                "cuts": cuts, "points": len(peaks),
+                "bpm": bpm, "key": key}
 
     except Exception as e:
         print(f"[WAVEFORM] Erro: {e}", flush=True)
